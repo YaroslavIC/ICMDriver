@@ -134,8 +134,6 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
-  // ICM20948_InitParams_t p;
-
   imu.p.hspi = &hspi1;
   imu.p.hdma_rx = &hdma_spi1_rx;
   imu.p.hdma_tx = &hdma_spi1_tx;

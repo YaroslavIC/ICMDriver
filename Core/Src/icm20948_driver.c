@@ -1,6 +1,6 @@
 // icm20948_driver.c
 // Драйвер ICM-20948 (только Accel+Gyro) по SPI + INT + DMA для STM32F401CCU6 (HAL)
-// Версия драйвера: 1.0.20
+// Версия драйвера: 1.1.0
 //
 // Все комментарии только через //, без /* и */.
 // Кодировка: Windows-1251.
@@ -344,7 +344,7 @@ ICM20948_Status_t ICM20948_Init(ICM20948_t* dev)
     uint8_t cfg;
     uint8_t status1;
 
-    if ((dev == 0)  )
+    if ((dev == 0))
     {
         return ICM20948_ERR_NULL_PTR;
     }
