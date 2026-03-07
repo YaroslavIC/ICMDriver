@@ -47,6 +47,8 @@ DMA_HandleTypeDef hdma_spi1_tx;
 DMA_HandleTypeDef hdma_spi3_rx;
 DMA_HandleTypeDef hdma_spi3_tx;
 
+TIM_HandleTypeDef htim2;
+
 /* USER CODE BEGIN PV */
 ICM20948_t imu;
 ICM20948_PhysSample_t s;
@@ -62,6 +64,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_SPI3_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 
@@ -128,20 +131,21 @@ int main(void)
   MX_DMA_Init();
   MX_SPI1_Init();
   MX_SPI3_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
-  ICM20948_InitParams_t p;
+  // ICM20948_InitParams_t p;
 
-  p.hspi = &hspi1;
-  p.hdma_rx = &hdma_spi1_rx;
-  p.hdma_tx = &hdma_spi1_tx;
-  p.cs_port = GPIOA;
-  p.cs_pin  = GPIO_PIN_4; // CS -> PA4
-  p.int_port = GPIOA;
-  p.int_pin  = GPIO_PIN_3; // INT -> PA3
-  p.spi_timeout_ms = ICM20948_SPI_TIMEOUT_MS_DEFAULT;
+  imu.p.hspi = &hspi1;
+  imu.p.hdma_rx = &hdma_spi1_rx;
+  imu.p.hdma_tx = &hdma_spi1_tx;
+  imu.p.cs_port = GPIOA;
+  imu.p.cs_pin  = GPIO_PIN_4; // CS -> PA4
+  imu.p.int_port = GPIOA;
+  imu.p.int_pin  = GPIO_PIN_3; // INT -> PA3
+  imu.p.spi_timeout_ms = ICM20948_SPI_TIMEOUT_MS_DEFAULT;
 
-  ICM20948_Init(&imu, &p);
+  ICM20948_Init(&imu);
 
   /* USER CODE END 2 */
 
@@ -150,8 +154,7 @@ int main(void)
   while (1)
   {
 	  IMUService();
-	  /* USER CODE END WHILE */
-
+    /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
 
@@ -282,6 +285,51 @@ static void MX_SPI3_Init(void)
 }
 
 /**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 83;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 65535;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -332,7 +380,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(ICM_CS_GPIO_Port, ICM_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;

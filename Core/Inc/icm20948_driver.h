@@ -429,12 +429,14 @@ typedef struct
     volatile uint8_t cal_reset;   // сбросить калибровку
     uint8_t gyro_cal_start;
 
+    ICM20948_InitParams_t p;
+
 
 } ICM20948_t;
 
 // Публичный API
 // Инициализация (SPI и DMA должны быть настроены снаружи, например CubeMX; драйвер использует переданные handle)
-ICM20948_Status_t ICM20948_Init(ICM20948_t* dev, const ICM20948_InitParams_t* p);
+ICM20948_Status_t ICM20948_Init(ICM20948_t* dev);
 
 // Обработка INT (вызывать из HAL_GPIO_EXTI_Callback)
 ICM20948_Status_t ICM20948_IrqHandler(ICM20948_t* dev, uint16_t gpio_pin);

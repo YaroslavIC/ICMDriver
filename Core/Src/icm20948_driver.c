@@ -336,7 +336,7 @@ static ICM20948_Status_t icm_cal_compute_result(ICM20948_t* dev)
     return ICM20948_OK;
 }
 
-ICM20948_Status_t ICM20948_Init(ICM20948_t* dev, const ICM20948_InitParams_t* p)
+ICM20948_Status_t ICM20948_Init(ICM20948_t* dev)
 {
     ICM20948_Status_t st;
     uint8_t who;
@@ -344,31 +344,31 @@ ICM20948_Status_t ICM20948_Init(ICM20948_t* dev, const ICM20948_InitParams_t* p)
     uint8_t cfg;
     uint8_t status1;
 
-    if ((dev == 0) || (p == 0))
+    if ((dev == 0)  )
     {
         return ICM20948_ERR_NULL_PTR;
     }
-    if ((p->hspi == 0) || (p->hdma_rx == 0) || (p->hdma_tx == 0))
+    if ((dev->p.hspi == 0) || (dev->p.hdma_rx == 0) || (dev->p.hdma_tx == 0))
     {
         return ICM20948_ERR_NULL_PTR;
     }
-    if ((p->cs_port == 0) || (p->int_port == 0))
+    if ((dev->p.cs_port == 0) || (dev->p.int_port == 0))
     {
         return ICM20948_ERR_NULL_PTR;
     }
-    if ((p->spi_timeout_ms == 0u) || (p->spi_timeout_ms > 1000u))
+    if ((dev->p.spi_timeout_ms == 0u) || (dev->p.spi_timeout_ms > 1000u))
     {
         return ICM20948_ERR_PARAM;
     }
 
-    dev->cfg.hspi = p->hspi;
-    dev->cfg.hdma_rx = p->hdma_rx;
-    dev->cfg.hdma_tx = p->hdma_tx;
-    dev->cfg.cs_port = p->cs_port;
-    dev->cfg.cs_pin = p->cs_pin;
-    dev->cfg.int_port = p->int_port;
-    dev->cfg.int_pin = p->int_pin;
-    dev->cfg.spi_timeout_ms = p->spi_timeout_ms;
+    dev->cfg.hspi = dev->p.hspi;
+    dev->cfg.hdma_rx = dev->p.hdma_rx;
+    dev->cfg.hdma_tx = dev->p.hdma_tx;
+    dev->cfg.cs_port = dev->p.cs_port;
+    dev->cfg.cs_pin = dev->p.cs_pin;
+    dev->cfg.int_port = dev->p.int_port;
+    dev->cfg.int_pin = dev->p.int_pin;
+    dev->cfg.spi_timeout_ms = dev->p.spi_timeout_ms;
 
     dev->state = ICM20948_STATE_UNINIT;
     dev->spi_busy = 0u;
