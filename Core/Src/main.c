@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "icm20948_driver.h"
+#include "mcp2515.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,9 +53,8 @@ TIM_HandleTypeDef htim2;
 /* USER CODE BEGIN PV */
 ICM20948_t imu;
 ICM20948_PhysSample_t s;
-
-
-
+mcp2515_t g_mcp2515;
+uint8_t int_level;
 
 /* USER CODE END PV */
 
@@ -123,7 +123,6 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  SystemCoreClockUpdate();
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -134,6 +133,8 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
+
+  /*
   imu.p.hspi = &hspi1;
   imu.p.hdma_rx = &hdma_spi1_rx;
   imu.p.hdma_tx = &hdma_spi1_tx;
@@ -144,6 +145,59 @@ int main(void)
   imu.p.spi_timeout_ms = ICM20948_SPI_TIMEOUT_MS_DEFAULT;
 
   ICM20948_Init(&imu);
+  */
+
+  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+  HAL_Delay(500);
+  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+  HAL_Delay(500);
+  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+  HAL_Delay(500);
+  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+  HAL_Delay(500);
+  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+
+
+
+  mcp2515_status_t st;
+
+  g_mcp2515.hspi = &hspi3;
+  g_mcp2515.htim_sched = &htim2;
+
+  g_mcp2515.cs_port = GPIOB;
+  g_mcp2515.cs_pin = GPIO_PIN_6;
+
+  g_mcp2515.int_port = GPIOB;
+  g_mcp2515.int_pin = GPIO_PIN_7;
+
+  g_mcp2515.cpu_hz = 84000000U;
+  g_mcp2515.mcp2515_osc_hz = 8000000U;
+  g_mcp2515.can_bitrate = 250000U;
+  g_mcp2515.poll_rate_hz_per_node = 50U;
+  g_mcp2515.response_timeout_us = 300U;
+
+  g_mcp2515.node_id_1 = 1U;
+  g_mcp2515.node_id_2 = 2U;
+
+  g_mcp2515.can_mode = MCP2515_MODE_NORMAL;
+
+  st = mcp2515_init(&g_mcp2515);
+  if (st != MCP2515_STATUS_OK)
+  {
+      Error_Handler();
+  }
+
+
+
+
+
+
+
+
+
+
+
+
 
   /* USER CODE END 2 */
 
@@ -151,7 +205,28 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  IMUService();
+	//  IMUService();
+
+	    int_level = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7);
+
+	    st = mcp2515_poll(&g_mcp2515);
+	    if (st != MCP2515_STATUS_OK)
+	    {
+	        // Можно поставить точку останова
+	    }
+
+	    while (g_mcp2515.rx_fifo_count != 0U)
+	    {
+
+
+	        st = mcp2515_pop_sample(&g_mcp2515);
+	        if (st != MCP2515_STATUS_OK)
+	        {
+	            break;
+	        }
+
+	    }
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -410,7 +485,7 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin : PB7 */
   GPIO_InitStruct.Pin = GPIO_PIN_7;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
@@ -434,6 +509,13 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef* hspi)
 	   ICM20948_SpiDmaCpltHandler(&imu, hspi);
 	   HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
     }
+
+  if ((hspi != NULL) &&
+      (g_mcp2515.hspi != NULL) &&
+      (hspi->Instance == g_mcp2515.hspi->Instance))
+  {
+      mcp2515_spi_txcplt_callback(&g_mcp2515, hspi);
+  }
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
@@ -441,9 +523,35 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   if (GPIO_Pin == GPIO_PIN_3)
     {
       ICM20948_IrqHandler(&imu, GPIO_Pin);
-      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    }
+
+  if (GPIO_Pin == g_mcp2515.int_pin)
+  {
+      mcp2515_exti_callback(&g_mcp2515, GPIO_Pin);
+  }
+}
+
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+    if ((hspi != NULL) &&
+        (g_mcp2515.hspi != NULL) &&
+        (hspi->Instance == g_mcp2515.hspi->Instance))
+    {
+        mcp2515_spi_error_callback(&g_mcp2515, hspi);
     }
 }
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if ((htim != NULL) &&
+        (g_mcp2515.htim_sched != NULL) &&
+        (htim->Instance == g_mcp2515.htim_sched->Instance))
+    {
+        mcp2515_tim_period_elapsed_callback(&g_mcp2515, htim);
+    }
+}
+
+
 /* USER CODE END 4 */
 
 /**
