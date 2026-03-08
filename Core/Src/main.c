@@ -54,7 +54,14 @@ TIM_HandleTypeDef htim2;
 ICM20948_t imu;
 ICM20948_PhysSample_t s;
 mcp2515_t g_mcp2515;
-uint8_t int_level;
+
+mcp2515_status_t g_mcp2515_status;
+
+volatile uint8_t dbg_canstat = 0U;
+volatile uint8_t dbg_caninte = 0U;
+volatile uint8_t dbg_canintf = 0U;
+volatile uint8_t dbg_eflg = 0U;
+volatile uint8_t dbg_int_level = 0U;
 
 /* USER CODE END PV */
 
@@ -148,13 +155,7 @@ int main(void)
   */
 
   HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-  HAL_Delay(500);
-  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-  HAL_Delay(500);
-  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-  HAL_Delay(500);
-  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-  HAL_Delay(500);
+  HAL_Delay(200);
   HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
 
 
@@ -173,8 +174,9 @@ int main(void)
   g_mcp2515.cpu_hz = 84000000U;
   g_mcp2515.mcp2515_osc_hz = 8000000U;
   g_mcp2515.can_bitrate = 250000U;
-  g_mcp2515.poll_rate_hz_per_node = 50U;
-  g_mcp2515.response_timeout_us = 300U;
+
+  g_mcp2515.poll_rate_hz_per_node = 0U;
+  g_mcp2515.response_timeout_us = 0U;
 
   g_mcp2515.node_id_1 = 1U;
   g_mcp2515.node_id_2 = 2U;
@@ -189,16 +191,6 @@ int main(void)
 
 
 
-
-
-
-
-
-
-
-
-
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -207,25 +199,31 @@ int main(void)
   {
 	//  IMUService();
 
-	    int_level = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7);
+	    dbg_int_level = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7);
 
-	    st = mcp2515_poll(&g_mcp2515);
-	    if (st != MCP2515_STATUS_OK)
+	    (void)mcp2515_debug_read_reg(&g_mcp2515, MCP2515_REG_CANSTAT, (uint8_t *)&dbg_canstat);
+	    (void)mcp2515_debug_read_reg(&g_mcp2515, MCP2515_REG_CANINTE, (uint8_t *)&dbg_caninte);
+	    (void)mcp2515_debug_read_reg(&g_mcp2515, MCP2515_REG_CANINTF, (uint8_t *)&dbg_canintf);
+	    (void)mcp2515_debug_read_reg(&g_mcp2515, MCP2515_REG_EFLG, (uint8_t *)&dbg_eflg);
+
+	    g_mcp2515_status = mcp2515_poll(&g_mcp2515);
+
+	    if (g_mcp2515.hb_1.valid != 0U)
 	    {
-	        // Можно поставить точку останова
+	        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+	        HAL_Delay(20);
+	        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
 	    }
 
-	    while (g_mcp2515.rx_fifo_count != 0U)
+	    if (g_mcp2515.hb_2.valid != 0U)
 	    {
-
-
-	        st = mcp2515_pop_sample(&g_mcp2515);
-	        if (st != MCP2515_STATUS_OK)
-	        {
-	            break;
-	        }
-
+	        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+	        HAL_Delay(20);
+	        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
 	    }
+
+	    HAL_Delay(10);
+
 
     /* USER CODE END WHILE */
 
@@ -342,7 +340,7 @@ static void MX_SPI3_Init(void)
   hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi3.Init.NSS = SPI_NSS_SOFT;
-  hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -527,7 +525,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
   if (GPIO_Pin == g_mcp2515.int_pin)
   {
-      mcp2515_exti_callback(&g_mcp2515, GPIO_Pin);
+	  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+	  mcp2515_exti_callback(&g_mcp2515, GPIO_Pin);
   }
 }
 
