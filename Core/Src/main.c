@@ -18,11 +18,16 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "icm20948_driver.h"
-#include "mcp2515.h"
+#include "can_mcp2515_odrive.h"
+#include <string.h>
+#include <math.h>
+#include <stdio.h>
+#include "usbd_cdc_if.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,7 +37,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define ODRV_AXIS_STATE_IDLE                  1U
+#define ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL   8U
+#define ODRV_CONTROL_MODE_TORQUE_CONTROL      1U
+#define ODRV_INPUT_MODE_PASSTHROUGH           1U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -53,15 +61,19 @@ TIM_HandleTypeDef htim2;
 /* USER CODE BEGIN PV */
 ICM20948_t imu;
 ICM20948_PhysSample_t s;
-mcp2515_t g_mcp2515;
 
-mcp2515_status_t g_mcp2515_status;
 
-volatile uint8_t dbg_canstat = 0U;
-volatile uint8_t dbg_caninte = 0U;
-volatile uint8_t dbg_canintf = 0U;
-volatile uint8_t dbg_eflg = 0U;
-volatile uint8_t dbg_int_level = 0U;
+static uint32_t g_last_diag_ms = 0U;
+static uint32_t g_last_cmd_ms  = 0U;
+static uint32_t g_test_start_ms = 0U;
+
+
+
+static can_mcp2515_odrive_t g_can_odrive;
+
+static uint8_t g_started = 0U;
+static char g_diag_line[192];
+
 
 /* USER CODE END PV */
 
@@ -104,6 +116,67 @@ void IMUService(void) {
 
 }
 
+static void app_debug_write_line(const char *s)
+{
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "%s\r\n", s);
+    if (n <= 0) {
+        return;
+    }
+
+    if (n >= (int)sizeof(buf)) {
+        n = sizeof(buf) - 1;
+    }
+
+    CDC_Transmit_FS((uint8_t *)buf, (uint16_t)n);
+}
+
+void app_can_odrive_init(void)
+{
+    memset(&g_can_odrive, 0, sizeof(g_can_odrive));
+
+    g_can_odrive.hspi = &hspi3;
+    g_can_odrive.cs_port = GPIOB;
+    g_can_odrive.cs_pin = GPIO_PIN_6;
+    g_can_odrive.int_port = GPIOB;
+    g_can_odrive.int_pin = GPIO_PIN_7;
+    g_can_odrive.mcp2515_osc_hz = 8000000U;
+    g_can_odrive.can_bitrate = 250000U;
+    g_can_odrive.node_id_1 = 1U;
+    g_can_odrive.node_id_2 = 2U;
+    g_can_odrive.mode = CAN_MCP2515_ODRIVE_MODE_NORMAL;
+    g_can_odrive.poll_pair_rate_hz = 250U;
+    g_can_odrive.reply_timeout_us = 3000U;
+    g_can_odrive.spi_timeout_us = 2000U;
+
+    if (can_mcp2515_odrive_init(&g_can_odrive) != CAN_MCP2515_ODRIVE_STATUS_OK)
+    {
+        Error_Handler();
+    }
+
+    if (can_mcp2515_odrive_enable_polling(&g_can_odrive, 1U) != CAN_MCP2515_ODRIVE_STATUS_OK)
+    {
+        Error_Handler();
+    }
+
+    g_started = 0U;
+    g_last_diag_ms = HAL_GetTick();
+}
+
+void app_can_odrive_start_sequence(void)
+{
+    if (g_started != 0U)
+    {
+        return;
+    }
+
+    // 8 = CLOSED_LOOP_CONTROL в ODrive enum.
+    // При необходимости замени на свои значения state/control/input mode.
+    (void)odrive_pair_set_axis_state(&g_can_odrive, 8U, 8U);
+   // (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
+    g_started = 1U;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -138,57 +211,38 @@ int main(void)
   MX_SPI1_Init();
   MX_SPI3_Init();
   MX_TIM2_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
 
-  /*
-  imu.p.hspi = &hspi1;
-  imu.p.hdma_rx = &hdma_spi1_rx;
-  imu.p.hdma_tx = &hdma_spi1_tx;
-  imu.p.cs_port = GPIOA;
-  imu.p.cs_pin  = GPIO_PIN_4; // CS -> PA4
-  imu.p.int_port = GPIOA;
-  imu.p.int_pin  = GPIO_PIN_3; // INT -> PA3
-  imu.p.spi_timeout_ms = ICM20948_SPI_TIMEOUT_MS_DEFAULT;
 
-  ICM20948_Init(&imu);
-  */
+  app_can_odrive_init();
+  HAL_Delay(20);
 
-  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-  HAL_Delay(200);
-  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+  app_can_odrive_start_sequence();
+  HAL_Delay(20);
 
+  /* Сначала torque mode + passthrough */
+  (void)odrive_pair_set_controller_mode(&g_can_odrive,
+                                        ODRV_CONTROL_MODE_TORQUE_CONTROL,
+                                        ODRV_INPUT_MODE_PASSTHROUGH,
+                                        ODRV_CONTROL_MODE_TORQUE_CONTROL,
+                                        ODRV_INPUT_MODE_PASSTHROUGH);
+  HAL_Delay(20);
 
+  /* Нулевой момент до входа в closed loop */
+  (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
+  HAL_Delay(20);
 
-  mcp2515_status_t st;
+  /* Переводим обе оси в CLOSED_LOOP_CONTROL */
+  (void)odrive_pair_set_axis_state(&g_can_odrive,
+                                   ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL,
+                                   ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL);
+  HAL_Delay(50);
 
-  g_mcp2515.hspi = &hspi3;
-  g_mcp2515.htim_sched = &htim2;
-
-  g_mcp2515.cs_port = GPIOB;
-  g_mcp2515.cs_pin = GPIO_PIN_6;
-
-  g_mcp2515.int_port = GPIOB;
-  g_mcp2515.int_pin = GPIO_PIN_7;
-
-  g_mcp2515.cpu_hz = 84000000U;
-  g_mcp2515.mcp2515_osc_hz = 8000000U;
-  g_mcp2515.can_bitrate = 250000U;
-
-  g_mcp2515.poll_rate_hz_per_node = 0U;
-  g_mcp2515.response_timeout_us = 0U;
-
-  g_mcp2515.node_id_1 = 1U;
-  g_mcp2515.node_id_2 = 2U;
-
-  g_mcp2515.can_mode = MCP2515_MODE_NORMAL;
-
-  st = mcp2515_init(&g_mcp2515);
-  if (st != MCP2515_STATUS_OK)
-  {
-      Error_Handler();
-  }
-
+  g_last_diag_ms  = HAL_GetTick();
+  g_last_cmd_ms   = HAL_GetTick();
+  g_test_start_ms = HAL_GetTick();
 
 
   /* USER CODE END 2 */
@@ -197,32 +251,58 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	//  IMUService();
 
-	    dbg_int_level = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7);
+	    can_mcp2515_odrive_process(&g_can_odrive);
 
-	    (void)mcp2515_debug_read_reg(&g_mcp2515, MCP2515_REG_CANSTAT, (uint8_t *)&dbg_canstat);
-	    (void)mcp2515_debug_read_reg(&g_mcp2515, MCP2515_REG_CANINTE, (uint8_t *)&dbg_caninte);
-	    (void)mcp2515_debug_read_reg(&g_mcp2515, MCP2515_REG_CANINTF, (uint8_t *)&dbg_canintf);
-	    (void)mcp2515_debug_read_reg(&g_mcp2515, MCP2515_REG_EFLG, (uint8_t *)&dbg_eflg);
-
-	    g_mcp2515_status = mcp2515_poll(&g_mcp2515);
-
-	    if (g_mcp2515.hb_1.valid != 0U)
+	    /* Мягкий torque-тест:
+	       0.00 Nm  -> 2 s
+	      +0.03 Nm  -> 2 s
+	       0.00 Nm  -> 2 s
+	      -0.03 Nm  -> 2 s
+	       0.00 Nm  -> 2 s
+	    */
+	    if ((HAL_GetTick() - g_last_cmd_ms) >= 20U)
 	    {
-	        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-	        HAL_Delay(20);
-	        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+	        uint32_t phase;
+	        float tq1 = 0.0f;
+	        float tq2 = 0.0f;
+
+	        g_last_cmd_ms = HAL_GetTick();
+	        phase = ((HAL_GetTick() - g_test_start_ms) / 2000U) % 3U;
+
+	        switch (phase)
+	        {
+	            case 0U:
+	                tq1 = 0.0f;
+	                tq2 = 0.0f;
+	                break;
+
+	            case 1U:
+	                tq1 = +0.00f;
+	                tq2 = +0.00f;
+	                break;
+
+	            case 2U:
+	            default:
+	                tq1 = 0.0f;
+	                tq2 = 0.0f;
+	                break;
+	        }
+
+	        (void)odrive_pair_set_input_torque(&g_can_odrive, tq1, tq2);
 	    }
 
-	    if (g_mcp2515.hb_2.valid != 0U)
+	    if ((HAL_GetTick() - g_last_diag_ms) >= 100U)
 	    {
-	        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-	        HAL_Delay(20);
-	        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-	    }
+	        g_last_diag_ms = HAL_GetTick();
 
-	    HAL_Delay(10);
+	        if (can_mcp2515_odrive_format_diag_line(&g_can_odrive,
+	                                                g_diag_line,
+	                                                (uint16_t)sizeof(g_diag_line)) == CAN_MCP2515_ODRIVE_STATUS_OK)
+	        {
+	            app_debug_write_line(g_diag_line);
+	        }
+	    }
 
 
     /* USER CODE END WHILE */
@@ -256,9 +336,9 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 25;
-  RCC_OscInitStruct.PLL.PLLN = 168;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -500,54 +580,25 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef* hspi)
-{
-  if  (hspi == &hspi1)
-    {
-	   ICM20948_SpiDmaCpltHandler(&imu, hspi);
-	   HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-    }
 
-  if ((hspi != NULL) &&
-      (g_mcp2515.hspi != NULL) &&
-      (hspi->Instance == g_mcp2515.hspi->Instance))
-  {
-      mcp2515_spi_txcplt_callback(&g_mcp2515, hspi);
-  }
-}
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  if (GPIO_Pin == GPIO_PIN_3)
-    {
-      ICM20948_IrqHandler(&imu, GPIO_Pin);
-    }
-
-  if (GPIO_Pin == g_mcp2515.int_pin)
+  if (GPIO_Pin == GPIO_PIN_7)
   {
-	  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-	  mcp2515_exti_callback(&g_mcp2515, GPIO_Pin);
+	  can_mcp2515_odrive_exti_callback(&g_can_odrive, GPIO_Pin);
+
   }
+}
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    can_mcp2515_odrive_spi_txrx_cplt_callback(&g_can_odrive, hspi);
 }
 
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
-    if ((hspi != NULL) &&
-        (g_mcp2515.hspi != NULL) &&
-        (hspi->Instance == g_mcp2515.hspi->Instance))
-    {
-        mcp2515_spi_error_callback(&g_mcp2515, hspi);
-    }
-}
-
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if ((htim != NULL) &&
-        (g_mcp2515.htim_sched != NULL) &&
-        (htim->Instance == g_mcp2515.htim_sched->Instance))
-    {
-        mcp2515_tim_period_elapsed_callback(&g_mcp2515, htim);
-    }
+    can_mcp2515_odrive_spi_error_callback(&g_can_odrive, hspi);
 }
 
 
