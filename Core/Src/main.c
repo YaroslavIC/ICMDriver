@@ -72,12 +72,11 @@ static uint32_t g_last_diag_ms = 0U;
 static uint32_t g_last_cmd_ms  = 0U;
 static uint32_t g_test_start_ms = 0U;
 
+static volatile uint8_t g_ctrl_step_pending = 0u;
+static volatile uint64_t g_ctrl_step_ts_us = 0ull;
 
-static uint32_t t0 = 0;
-static uint8_t started = 0;
-static float torque = 0.13;
-
-
+static float g_torque_cmd = 0.0f;
+static uint8_t g_control_enabled = 0u;
 
 static can_mcp2515_odrive_t g_can_odrive;
 
@@ -277,13 +276,24 @@ void EKF_init(void){
 
 
 
-int _write(int file, char *ptr, int len)
+static void ControlTorqueStep(void)
 {
-    // Просто передаем данные в USB
-    CDC_Transmit_FS((uint8_t*)ptr, len);
-    return len;
-}
+    if (g_control_enabled == 0u)
+    {
+        (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
+        return;
+    }
 
+    if (snap.valid == 0u)
+    {
+        (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
+        return;
+    }
+
+    // Временный тестовый канал.
+    // Позже сюда вставим регулятор.
+    (void)odrive_pair_set_input_torque(&g_can_odrive, +g_torque_cmd, -g_torque_cmd);
+}
 
 
 /* USER CODE END 0 */
@@ -329,9 +339,10 @@ int main(void)
 
   odrive_full_init();
 
+  EKF_init();
+
   HAL_TIM_Base_Start_IT(&htim11);
 
-  EKF_init();
 
   /* USER CODE END 2 */
 
@@ -339,41 +350,19 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	ICM20948_Service(&imu);
+	    ICM20948_Service(&imu);
 
-	can_mcp2515_odrive_process(&g_can_odrive);
+	    can_mcp2515_odrive_process(&g_can_odrive);
 
-	//ICM20948_GetLatestPhys(&imu,&s);
+	    ekf_driver_update_inputs_from_drivers(&g_ekf, &imu, &g_can_odrive);
+	    ekf_driver_process_pending(&g_ekf);
+	    ekf_driver_get_state_snapshot(&g_ekf, &snap);
 
-    ekf_driver_update_inputs_from_drivers(&g_ekf, &imu, &g_can_odrive);
-    ekf_driver_process_pending(&g_ekf);
-    ekf_driver_get_state_snapshot(&g_ekf, &snap);
-
-
-
-
-
-
-
-    if (!started)
-    {
-        started = 1;
-        t0 = HAL_GetTick();
-
-        (void)odrive_pair_set_controller_mode(&g_can_odrive, 1, 1, 1, 1); // torque + passthrough, если у тебя такие enum
-        (void)odrive_pair_set_axis_state(&g_can_odrive, 8, 8);             // CLOSED_LOOP_CONTROL
-    }
-
-    if ((HAL_GetTick() - t0) < 1500U)
-    {
-        (void)odrive_pair_set_input_torque(&g_can_odrive, +torque, -torque);
-    }
-    else
-    {
-        (void)odrive_pair_set_input_torque(&g_can_odrive, 0, 0);
-    }
-
-
+	    if (g_ctrl_step_pending != 0u)
+	    {
+	        g_ctrl_step_pending = 0u;
+	        ControlTorqueStep();
+	    }
 
 
 
@@ -711,10 +700,23 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
     can_mcp2515_odrive_spi_error_callback(&g_can_odrive, hspi);
 }
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-	  if (htim->Instance == TIM11)
-	  {
-		  (void)ekf_driver_request_step_isr(&g_ekf, icm_micros64(&imu));
-	  }
+	static uint8_t ctrl_div = 0u;
+	uint64_t t_us;
+
+	if (htim->Instance == TIM11)
+	{
+		t_us = icm_micros64(&imu);
+
+		(void)ekf_driver_request_step_isr(&g_ekf, t_us);
+
+		ctrl_div++;
+		if (ctrl_div >= 5u)
+		{
+			ctrl_div = 0u;
+			g_ctrl_step_pending = 1u;
+			g_ctrl_step_ts_us = t_us;
+		}
+	}
 }
 
 /* USER CODE END 4 */
