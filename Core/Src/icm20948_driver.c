@@ -206,7 +206,7 @@ static uint64_t icm_cycles64(ICM20948_t* dev)
     return (((uint64_t)hi) << 32) | (uint64_t)now;
 }
 
-static uint64_t icm_micros64(ICM20948_t* dev)
+uint64_t icm_micros64(ICM20948_t* dev)
 {
     uint32_t div;
 

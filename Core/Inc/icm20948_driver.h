@@ -464,6 +464,8 @@ ICM20948_Status_t ICM20948_CalSetStep(ICM20948_t* dev);
 ICM20948_Status_t ICM20948_CalGetStatus(ICM20948_t* dev, ICM20948_CalStatus_t* out);
 ICM20948_Status_t ICM20948_CalGetResult(ICM20948_t* dev, ICM20948_CalResult_t* out);
 
+uint64_t icm_micros64(ICM20948_t* dev);
+
 #ifdef __cplusplus
 }
 #endif
