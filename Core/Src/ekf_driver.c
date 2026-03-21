@@ -828,6 +828,7 @@ ekf_status_t ekf_driver_get_state_snapshot(ekf_driver_t *dev, ekf_state_snapshot
 
     out->ts_us = dev->state.last_step_ts_us;
     out->pitch_rad = dev->state.x[0];
+    out->pitch_rate_rad_s = (dev->last_meas.gy - dev->state.x[1]);
     out->gyro_bias_rads = dev->state.x[1];
     out->wheel_pos_avg = dev->state.x[2];
     out->wheel_vel_avg = dev->state.x[3];

@@ -24,7 +24,7 @@ extern "C" {
 
 #define EKF_DRIVER_VERSION_MAJOR        (0u)
 #define EKF_DRIVER_VERSION_MINOR        (1u)
-#define EKF_DRIVER_VERSION_PATCH        (0u)
+#define EKF_DRIVER_VERSION_PATCH        (1u)
 
 #define EKF_STATE_DIM                   (6u)
 
@@ -202,6 +202,7 @@ typedef struct
 {
     uint64_t ts_us;
     float pitch_rad;
+    float pitch_rate_rad_s;
     float gyro_bias_rads;
     float wheel_pos_avg;
     float wheel_vel_avg;

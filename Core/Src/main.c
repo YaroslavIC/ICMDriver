@@ -28,6 +28,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include "usbd_cdc_if.h"
 /* USER CODE END Includes */
 
@@ -42,6 +43,18 @@
 #define ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL   8U
 #define ODRV_CONTROL_MODE_TORQUE_CONTROL      1U
 #define ODRV_INPUT_MODE_PASSTHROUGH           1U
+
+#define CONTROL_U_LIMIT                       0.45f
+#define CONTROL_K_PITCH                       1.6f
+#define CONTROL_K_PITCH_RATE                  0.45f
+
+#define CONTROL_K_SYNC                        0.06f
+#define CONTROL_U_SYNC_LIMIT                  0.03f
+#define VERTICAL_PITCH_THRESH_MRAD            80
+#define VERTICAL_RATE_THRESH_MRADS            200
+
+#define CONTROL_K_WHEEL_VEL 				  0.08f
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -76,6 +89,14 @@ static volatile uint8_t g_ctrl_step_pending = 0u;
 static volatile uint64_t g_ctrl_step_ts_us = 0ull;
 
 static float g_torque_cmd = 0.0f;
+static float g_left_cmd = 0.0f;
+static float g_right_cmd = 0.0f;
+static float g_u_sync = 0.0f;
+static float g_vel1_raw = 0.0f;
+static float g_vel2_raw = 0.0f;
+static float g_vel1_norm = 0.0f;
+static float g_vel2_norm = 0.0f;
+static float g_wheel_vel_diff_raw = 0.0f;
 static uint8_t g_control_enabled = 0u;
 
 static can_mcp2515_odrive_t g_can_odrive;
@@ -138,7 +159,187 @@ static void app_debug_write_line(const char *s)
         n = sizeof(buf) - 1;
     }
 
-    CDC_Transmit_FS((uint8_t *)buf, (uint16_t)n);
+    (void)CDC_Transmit_FS((uint8_t *)buf, (uint16_t)n);
+}
+
+static void app_debug_printf(const char *fmt, ...)
+{
+    char buf[256];
+    va_list args;
+    int n;
+
+    va_start(args, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    if (n <= 0)
+    {
+        return;
+    }
+
+    if (n >= (int)sizeof(buf))
+    {
+        n = (int)sizeof(buf) - 1;
+    }
+
+    (void)CDC_Transmit_FS((uint8_t *)buf, (uint16_t)n);
+}
+
+static float control_clamp(float v, float vmin, float vmax)
+{
+    if (v < vmin)
+    {
+        return vmin;
+    }
+    if (v > vmax)
+    {
+        return vmax;
+    }
+    return v;
+}
+
+static void VerticalLedStep(const ekf_state_snapshot_t *state)
+{
+    int32_t pitch_mrad;
+    int32_t rate_mrads;
+    int32_t pitch_abs;
+    int32_t rate_abs;
+
+    if ((state == NULL) || (state->valid == 0u))
+    {
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+        return;
+    }
+
+    pitch_mrad = (int32_t)(state->pitch_rad * 1000.0f);
+    rate_mrads = (int32_t)(state->pitch_rate_rad_s * 1000.0f);
+    pitch_abs = (pitch_mrad >= 0) ? pitch_mrad : -pitch_mrad;
+    rate_abs = (rate_mrads >= 0) ? rate_mrads : -rate_mrads;
+
+    if ((pitch_abs <= VERTICAL_PITCH_THRESH_MRAD) &&
+        (rate_abs <= VERTICAL_RATE_THRESH_MRADS))
+    {
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+    }
+    else
+    {
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+    }
+}
+
+static void DebugTelemetryStep(void)
+{
+    static uint32_t last_dbg_ms = 0u;
+    uint32_t now_ms;
+
+    int32_t pitch_mrad;
+    int32_t rate_mrads;
+    int32_t wv_x1000;
+    int32_t wd_x1000;
+
+    int32_t p_x1000;
+    int32_t d_x1000;
+    int32_t u_pd_raw_x1000;
+    int32_t u_pd_clamped_x1000;
+
+    int32_t u_x1000;
+    int32_t usync_x1000;
+    int32_t l_x1000;
+    int32_t r_x1000;
+
+    int32_t v1raw_x1000;
+    int32_t v2raw_x1000;
+    int32_t v1n_x1000;
+    int32_t v2n_x1000;
+    int32_t wdraw_x1000;
+
+    uint8_t sat_flag = 0u;
+
+    now_ms = HAL_GetTick();
+    if ((uint32_t)(now_ms - last_dbg_ms) < 100u)
+    {
+        return;
+    }
+    last_dbg_ms = now_ms;
+
+    pitch_mrad = (int32_t)(snap.pitch_rad * 1000.0f);
+    rate_mrads = (int32_t)(snap.pitch_rate_rad_s * 1000.0f);
+    wv_x1000 = (int32_t)(snap.wheel_vel_avg * 1000.0f);
+    wd_x1000 = (int32_t)(snap.wheel_vel_diff * 1000.0f);
+
+    /* === P и D компоненты === */
+    float p_term = (CONTROL_K_PITCH * snap.pitch_rad);
+    float d_term = (CONTROL_K_PITCH_RATE * snap.pitch_rate_rad_s);
+    float u_pd_raw = p_term + d_term;
+
+    float u_pd_clamped = control_clamp(u_pd_raw,
+                                       -(CONTROL_U_LIMIT - CONTROL_U_SYNC_LIMIT),
+                                       +(CONTROL_U_LIMIT - CONTROL_U_SYNC_LIMIT));
+
+    p_x1000 = (int32_t)(p_term * 1000.0f);
+    d_x1000 = (int32_t)(d_term * 1000.0f);
+    u_pd_raw_x1000 = (int32_t)(u_pd_raw * 1000.0f);
+    u_pd_clamped_x1000 = (int32_t)(u_pd_clamped * 1000.0f);
+
+    /* === SATURATION FLAG === */
+    if ((u_pd_raw > u_pd_clamped + 1e-6f) ||
+        (u_pd_raw < u_pd_clamped - 1e-6f))
+    {
+        sat_flag = 1u;
+    }
+
+    /* === остальное как было === */
+    u_x1000 = (int32_t)(g_torque_cmd * 1000.0f);
+    usync_x1000 = (int32_t)(g_u_sync * 1000.0f);
+    l_x1000 = (int32_t)(g_left_cmd * 1000.0f);
+    r_x1000 = (int32_t)(g_right_cmd * 1000.0f);
+
+    v1raw_x1000 = (int32_t)(g_vel1_raw * 1000.0f);
+    v2raw_x1000 = (int32_t)(g_vel2_raw * 1000.0f);
+    v1n_x1000 = (int32_t)(g_vel1_norm * 1000.0f);
+    v2n_x1000 = (int32_t)(g_vel2_norm * 1000.0f);
+    wdraw_x1000 = (int32_t)(g_wheel_vel_diff_raw * 1000.0f);
+
+    app_debug_printf(
+        "DBG t=%lu en=%u valid=%u "
+        "pitch=%ld rate=%ld "
+        "P=%ld D=%ld raw=%ld clamp=%ld sat=%u "
+        "wv=%ld wd=%ld "
+        "v1=%ld v2=%ld v1n=%ld v2n=%ld wdr=%ld "
+        "u=%ld usync=%ld L=%ld R=%ld "
+        "Kp=%ld Kd=%ld Ks=%ld\r\n",
+
+        (unsigned long)now_ms,
+        (unsigned)g_control_enabled,
+        (unsigned)snap.valid,
+
+        (long)pitch_mrad,
+        (long)rate_mrads,
+
+        (long)p_x1000,
+        (long)d_x1000,
+        (long)u_pd_raw_x1000,
+        (long)u_pd_clamped_x1000,
+        (unsigned)sat_flag,
+
+        (long)wv_x1000,
+        (long)wd_x1000,
+
+        (long)v1raw_x1000,
+        (long)v2raw_x1000,
+        (long)v1n_x1000,
+        (long)v2n_x1000,
+        (long)wdraw_x1000,
+
+        (long)u_x1000,
+        (long)usync_x1000,
+        (long)l_x1000,
+        (long)r_x1000,
+
+        (long)(CONTROL_K_PITCH * 1000.0f),
+        (long)(CONTROL_K_PITCH_RATE * 1000.0f),
+        (long)(CONTROL_K_SYNC * 1000.0f)
+    );
 }
 
 void app_can_odrive_init(void)
@@ -275,26 +476,99 @@ void EKF_init(void){
 }
 
 
-
 static void ControlTorqueStep(void)
 {
+    float pitch_err;
+    float pitch_rate;
+    float u_pd;
+    float u_sync;
+    float left_cmd;
+    float right_cmd;
+    float vel1;
+    float vel2;
+    float wheel_vel_diff;
+
     if (g_control_enabled == 0u)
     {
+        g_torque_cmd = 0.0f;
+        g_u_sync = 0.0f;
+        g_left_cmd = 0.0f;
+        g_right_cmd = 0.0f;
+        g_vel1_raw = 0.0f;
+        g_vel2_raw = 0.0f;
+        g_vel1_norm = 0.0f;
+        g_vel2_norm = 0.0f;
+        g_wheel_vel_diff_raw = 0.0f;
         (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
         return;
     }
 
     if (snap.valid == 0u)
     {
+        g_torque_cmd = 0.0f;
+        g_u_sync = 0.0f;
+        g_left_cmd = 0.0f;
+        g_right_cmd = 0.0f;
+        g_vel1_raw = 0.0f;
+        g_vel2_raw = 0.0f;
+        g_vel1_norm = 0.0f;
+        g_vel2_norm = 0.0f;
+        g_wheel_vel_diff_raw = 0.0f;
         (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
         return;
     }
 
-    // Временный тестовый канал.
-    // Позже сюда вставим регулятор.
-    (void)odrive_pair_set_input_torque(&g_can_odrive, +g_torque_cmd, -g_torque_cmd);
-}
+    /* RAW скорости */
+    g_vel1_raw = g_can_odrive.pair.vel1;
+    g_vel2_raw = g_can_odrive.pair.vel2;
 
+    vel1 = g_vel1_raw;
+    vel2 = -g_vel2_raw;
+
+    /* 🔴 КРИТИЧЕСКОЕ: ограничение скорости (анти-разнос) */
+    vel1 = control_clamp(vel1, -1500.0f, 1500.0f);
+    vel2 = control_clamp(vel2, -1500.0f, 1500.0f);
+
+    /* Разница скоростей */
+    wheel_vel_diff = 0.5f * (vel1 - vel2);
+
+    g_vel1_norm = vel1;
+    g_vel2_norm = vel2;
+    g_wheel_vel_diff_raw = wheel_vel_diff;
+
+    /* Баланс */
+    pitch_err = snap.pitch_rad;
+    pitch_rate = snap.pitch_rate_rad_s;
+
+    u_pd = (CONTROL_K_PITCH * pitch_err) +
+           (CONTROL_K_PITCH_RATE * pitch_rate) -
+           (CONTROL_K_WHEEL_VEL * snap.wheel_vel_avg);
+
+
+    /* запас под sync */
+    u_pd = control_clamp(u_pd,
+                         -(CONTROL_U_LIMIT - CONTROL_U_SYNC_LIMIT),
+                         +(CONTROL_U_LIMIT - CONTROL_U_SYNC_LIMIT));
+
+    /* 🔴 sync теперь адекватный */
+    u_sync = -(CONTROL_K_SYNC * wheel_vel_diff);
+
+    /* ограничим сильнее */
+    u_sync = control_clamp(u_sync, -20.0f, 20.0f);
+
+    left_cmd = u_pd + u_sync;
+    right_cmd = -u_pd - u_sync;
+
+    left_cmd = control_clamp(left_cmd, -CONTROL_U_LIMIT, CONTROL_U_LIMIT);
+    right_cmd = control_clamp(right_cmd, -CONTROL_U_LIMIT, CONTROL_U_LIMIT);
+
+    g_torque_cmd = u_pd;
+    g_u_sync = u_sync;
+    g_left_cmd = left_cmd;
+    g_right_cmd = right_cmd;
+
+    (void)odrive_pair_set_input_torque(&g_can_odrive, left_cmd, right_cmd);
+}
 
 /* USER CODE END 0 */
 
@@ -357,6 +631,8 @@ int main(void)
 	    ekf_driver_update_inputs_from_drivers(&g_ekf, &imu, &g_can_odrive);
 	    ekf_driver_process_pending(&g_ekf);
 	    ekf_driver_get_state_snapshot(&g_ekf, &snap);
+	    VerticalLedStep(&snap);
+	    DebugTelemetryStep();
 
 	    if (g_ctrl_step_pending != 0u)
 	    {
