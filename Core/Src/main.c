@@ -287,6 +287,7 @@ static void DebugTelemetryStep(void)
     u_pd_clamped_x1000 = (int32_t)(u_pd_clamped * 1000.0f);
     vterm_x1000 = (int32_t)(g_u_wheel_vel * 1000.0f);
 
+
     /* === SATURATION FLAG === */
     if ((u_pd_raw > u_pd_clamped + 1e-6f) ||
         (u_pd_raw < u_pd_clamped - 1e-6f))
