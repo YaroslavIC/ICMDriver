@@ -34,6 +34,12 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum
+{
+    CONTROL_MODE_IDLE = 0,
+    CONTROL_MODE_CATCH,
+    CONTROL_MODE_BALANCE
+} control_mode_t;
 
 /* USER CODE END PTD */
 
@@ -53,9 +59,13 @@
 #define VERTICAL_PITCH_THRESH_MRAD            80
 #define VERTICAL_RATE_THRESH_MRADS            200
 
-#define CONTROL_K_WHEEL_VEL 				  0.2f
+#define CONTROL_K_WHEEL_VEL                   0.2f
+#define CONTROL_PITCH_TRIM_RAD                (0.20f)
 
-#define CONTROL_PITCH_TRIM_RAD 				   (0.20f)
+#define CATCH2BAL_PITCH_TH_rad                0.08f
+#define CATCH2BAL_RATE_TH_rads                0.80f
+#define BAL2CATCH_PITCH_TH_rad                0.16f
+#define CATCH_HOLD_MS                         200U
 
 /* USER CODE END PD */
 
@@ -101,6 +111,8 @@ static float g_vel1_norm = 0.0f;
 static float g_vel2_norm = 0.0f;
 static float g_wheel_vel_diff_raw = 0.0f;
 static uint8_t g_control_enabled = 0u;
+static control_mode_t g_control_mode = CONTROL_MODE_IDLE;
+static uint32_t g_control_mode_enter_ms = 0u;
 
 static can_mcp2515_odrive_t g_can_odrive;
 
@@ -119,12 +131,94 @@ static void MX_SPI3_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM11_Init(void);
 /* USER CODE BEGIN PFP */
-
+static const char *ControlModeToString(control_mode_t mode);
+static void ControlSetMode(control_mode_t mode, uint32_t now_ms);
+static void ControlUpdateMode(uint32_t now_ms, float pitch_err, float pitch_rate);
+static void ControlResetOutputs(void);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static const char *ControlModeToString(control_mode_t mode)
+{
+    switch (mode)
+    {
+    case CONTROL_MODE_IDLE:
+        return "IDLE";
+
+    case CONTROL_MODE_CATCH:
+        return "CATCH";
+
+    case CONTROL_MODE_BALANCE:
+        return "BAL";
+
+    default:
+        return "UNK";
+    }
+}
+
+static void ControlSetMode(control_mode_t mode, uint32_t now_ms)
+{
+    if (g_control_mode == mode)
+    {
+        return;
+    }
+
+    g_control_mode = mode;
+    g_control_mode_enter_ms = now_ms;
+}
+
+static void ControlUpdateMode(uint32_t now_ms, float pitch_err, float pitch_rate)
+{
+    if ((g_control_enabled == 0u) || (snap.valid == 0u))
+    {
+        ControlSetMode(CONTROL_MODE_IDLE, now_ms);
+        return;
+    }
+
+    switch (g_control_mode)
+    {
+    case CONTROL_MODE_IDLE:
+        ControlSetMode(CONTROL_MODE_CATCH, now_ms);
+        break;
+
+    case CONTROL_MODE_CATCH:
+        if (((uint32_t)(now_ms - g_control_mode_enter_ms) >= CATCH_HOLD_MS) &&
+            (fabsf(pitch_err) < CATCH2BAL_PITCH_TH_rad) &&
+            (fabsf(pitch_rate) < CATCH2BAL_RATE_TH_rads))
+        {
+            ControlSetMode(CONTROL_MODE_BALANCE, now_ms);
+        }
+        break;
+
+    case CONTROL_MODE_BALANCE:
+        if (fabsf(pitch_err) > BAL2CATCH_PITCH_TH_rad)
+        {
+            ControlSetMode(CONTROL_MODE_CATCH, now_ms);
+        }
+        break;
+
+    default:
+        ControlSetMode(CONTROL_MODE_IDLE, now_ms);
+        break;
+    }
+}
+
+static void ControlResetOutputs(void)
+{
+    g_torque_cmd = 0.0f;
+    g_u_sync = 0.0f;
+    g_left_cmd = 0.0f;
+    g_right_cmd = 0.0f;
+    g_u_wheel_vel = 0.0f;
+    g_vel1_raw = 0.0f;
+    g_vel2_raw = 0.0f;
+    g_vel1_norm = 0.0f;
+    g_vel2_norm = 0.0f;
+    g_wheel_vel_diff_raw = 0.0f;
+}
+
 void IMUService(void) {
 
 	(void) ICM20948_Service(&imu);
@@ -272,7 +366,8 @@ static void DebugTelemetryStep(void)
     wd_x1000 = (int32_t)(snap.wheel_vel_diff * 1000.0f);
 
     /* === P и D компоненты === */
-    float p_term = (CONTROL_K_PITCH * snap.pitch_rad);
+    float pitch_err = snap.pitch_rad + CONTROL_PITCH_TRIM_RAD;
+    float p_term = (CONTROL_K_PITCH * pitch_err);
     float d_term = (CONTROL_K_PITCH_RATE * snap.pitch_rate_rad_s);
     float v_term = -(CONTROL_K_WHEEL_VEL * snap.wheel_vel_avg);
     float u_pd_raw = p_term + d_term + v_term;
@@ -286,7 +381,6 @@ static void DebugTelemetryStep(void)
     u_pd_raw_x1000 = (int32_t)(u_pd_raw * 1000.0f);
     u_pd_clamped_x1000 = (int32_t)(u_pd_clamped * 1000.0f);
     vterm_x1000 = (int32_t)(g_u_wheel_vel * 1000.0f);
-
 
     /* === SATURATION FLAG === */
     if ((u_pd_raw > u_pd_clamped + 1e-6f) ||
@@ -308,7 +402,7 @@ static void DebugTelemetryStep(void)
     wdraw_x1000 = (int32_t)(g_wheel_vel_diff_raw * 1000.0f);
 
     app_debug_printf(
-        "DBG t=%lu en=%u valid=%u "
+        "DBG t=%lu en=%u valid=%u mode=%s "
         "pitch=%ld rate=%ld "
         "P=%ld D=%ld V=%ld raw=%ld clamp=%ld sat=%u "
         "wv=%ld wd=%ld "
@@ -319,6 +413,7 @@ static void DebugTelemetryStep(void)
         (unsigned long)now_ms,
         (unsigned)g_control_enabled,
         (unsigned)snap.valid,
+        ControlModeToString(g_control_mode),
 
         (long)pitch_mrad,
         (long)rate_mrads,
@@ -486,6 +581,7 @@ void EKF_init(void){
 
 static void ControlTorqueStep(void)
 {
+    uint32_t now_ms;
     float pitch_err;
     float pitch_rate;
     float u_pd;
@@ -496,32 +592,12 @@ static void ControlTorqueStep(void)
     float vel2;
     float wheel_vel_diff;
 
-    if (g_control_enabled == 0u)
-    {
-        g_torque_cmd = 0.0f;
-        g_u_sync = 0.0f;
-        g_left_cmd = 0.0f;
-        g_right_cmd = 0.0f;
-        g_vel1_raw = 0.0f;
-        g_vel2_raw = 0.0f;
-        g_vel1_norm = 0.0f;
-        g_vel2_norm = 0.0f;
-        g_wheel_vel_diff_raw = 0.0f;
-        (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
-        return;
-    }
+    now_ms = HAL_GetTick();
 
-    if (snap.valid == 0u)
+    if ((g_control_enabled == 0u) || (snap.valid == 0u))
     {
-        g_torque_cmd = 0.0f;
-        g_u_sync = 0.0f;
-        g_left_cmd = 0.0f;
-        g_right_cmd = 0.0f;
-        g_vel1_raw = 0.0f;
-        g_vel2_raw = 0.0f;
-        g_vel1_norm = 0.0f;
-        g_vel2_norm = 0.0f;
-        g_wheel_vel_diff_raw = 0.0f;
+        ControlSetMode(CONTROL_MODE_IDLE, now_ms);
+        ControlResetOutputs();
         (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
         return;
     }
@@ -533,7 +609,7 @@ static void ControlTorqueStep(void)
     vel1 = g_vel1_raw;
     vel2 = -g_vel2_raw;
 
-    /* 🔴 КРИТИЧЕСКОЕ: ограничение скорости (анти-разнос) */
+    /* ограничение скорости (анти-разнос) */
     vel1 = control_clamp(vel1, -1500.0f, 1500.0f);
     vel2 = control_clamp(vel2, -1500.0f, 1500.0f);
 
@@ -544,10 +620,17 @@ static void ControlTorqueStep(void)
     g_vel2_norm = vel2;
     g_wheel_vel_diff_raw = wheel_vel_diff;
 
-    /* Баланс */
     pitch_err = snap.pitch_rad + CONTROL_PITCH_TRIM_RAD;
-
     pitch_rate = snap.pitch_rate_rad_s;
+
+    ControlUpdateMode(now_ms, pitch_err, pitch_rate);
+
+    if (g_control_mode == CONTROL_MODE_IDLE)
+    {
+        ControlResetOutputs();
+        (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
+        return;
+    }
 
     g_u_wheel_vel = -(CONTROL_K_WHEEL_VEL * snap.wheel_vel_avg);
 
@@ -555,13 +638,11 @@ static void ControlTorqueStep(void)
            (CONTROL_K_PITCH_RATE * pitch_rate) +
            g_u_wheel_vel;
 
-
     /* запас под sync */
     u_pd = control_clamp(u_pd,
                          -(CONTROL_U_LIMIT - CONTROL_U_SYNC_LIMIT),
                          +(CONTROL_U_LIMIT - CONTROL_U_SYNC_LIMIT));
 
-    /* 🔴 sync теперь адекватный */
     u_sync = -(CONTROL_K_SYNC * wheel_vel_diff);
 
     /* отдельное ограничение sync-канала */
