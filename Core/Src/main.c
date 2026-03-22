@@ -44,8 +44,8 @@
 #define ODRV_CONTROL_MODE_TORQUE_CONTROL      1U
 #define ODRV_INPUT_MODE_PASSTHROUGH           1U
 
-#define CONTROL_U_LIMIT                       0.45f
-#define CONTROL_K_PITCH                       1.6f
+#define CONTROL_U_LIMIT                       0.40f
+#define CONTROL_K_PITCH                       0.8f
 #define CONTROL_K_PITCH_RATE                  0.45f
 
 #define CONTROL_K_SYNC                        0.06f
@@ -53,7 +53,9 @@
 #define VERTICAL_PITCH_THRESH_MRAD            80
 #define VERTICAL_RATE_THRESH_MRADS            200
 
-#define CONTROL_K_WHEEL_VEL 				  0.08f
+#define CONTROL_K_WHEEL_VEL 				  0.2f
+
+#define CONTROL_PITCH_TRIM_RAD 				   (0.20f)
 
 /* USER CODE END PD */
 
@@ -92,6 +94,7 @@ static float g_torque_cmd = 0.0f;
 static float g_left_cmd = 0.0f;
 static float g_right_cmd = 0.0f;
 static float g_u_sync = 0.0f;
+static float g_u_wheel_vel = 0.0f;
 static float g_vel1_raw = 0.0f;
 static float g_vel2_raw = 0.0f;
 static float g_vel1_norm = 0.0f;
@@ -241,6 +244,7 @@ static void DebugTelemetryStep(void)
     int32_t d_x1000;
     int32_t u_pd_raw_x1000;
     int32_t u_pd_clamped_x1000;
+    int32_t vterm_x1000;
 
     int32_t u_x1000;
     int32_t usync_x1000;
@@ -270,7 +274,8 @@ static void DebugTelemetryStep(void)
     /* === P и D компоненты === */
     float p_term = (CONTROL_K_PITCH * snap.pitch_rad);
     float d_term = (CONTROL_K_PITCH_RATE * snap.pitch_rate_rad_s);
-    float u_pd_raw = p_term + d_term;
+    float v_term = -(CONTROL_K_WHEEL_VEL * snap.wheel_vel_avg);
+    float u_pd_raw = p_term + d_term + v_term;
 
     float u_pd_clamped = control_clamp(u_pd_raw,
                                        -(CONTROL_U_LIMIT - CONTROL_U_SYNC_LIMIT),
@@ -280,6 +285,7 @@ static void DebugTelemetryStep(void)
     d_x1000 = (int32_t)(d_term * 1000.0f);
     u_pd_raw_x1000 = (int32_t)(u_pd_raw * 1000.0f);
     u_pd_clamped_x1000 = (int32_t)(u_pd_clamped * 1000.0f);
+    vterm_x1000 = (int32_t)(g_u_wheel_vel * 1000.0f);
 
     /* === SATURATION FLAG === */
     if ((u_pd_raw > u_pd_clamped + 1e-6f) ||
@@ -303,7 +309,7 @@ static void DebugTelemetryStep(void)
     app_debug_printf(
         "DBG t=%lu en=%u valid=%u "
         "pitch=%ld rate=%ld "
-        "P=%ld D=%ld raw=%ld clamp=%ld sat=%u "
+        "P=%ld D=%ld V=%ld raw=%ld clamp=%ld sat=%u "
         "wv=%ld wd=%ld "
         "v1=%ld v2=%ld v1n=%ld v2n=%ld wdr=%ld "
         "u=%ld usync=%ld L=%ld R=%ld "
@@ -318,6 +324,7 @@ static void DebugTelemetryStep(void)
 
         (long)p_x1000,
         (long)d_x1000,
+        (long)vterm_x1000,
         (long)u_pd_raw_x1000,
         (long)u_pd_clamped_x1000,
         (unsigned)sat_flag,
@@ -537,12 +544,15 @@ static void ControlTorqueStep(void)
     g_wheel_vel_diff_raw = wheel_vel_diff;
 
     /* Баланс */
-    pitch_err = snap.pitch_rad;
+    pitch_err = snap.pitch_rad + CONTROL_PITCH_TRIM_RAD;
+
     pitch_rate = snap.pitch_rate_rad_s;
 
+    g_u_wheel_vel = -(CONTROL_K_WHEEL_VEL * snap.wheel_vel_avg);
+
     u_pd = (CONTROL_K_PITCH * pitch_err) +
-           (CONTROL_K_PITCH_RATE * pitch_rate) -
-           (CONTROL_K_WHEEL_VEL * snap.wheel_vel_avg);
+           (CONTROL_K_PITCH_RATE * pitch_rate) +
+           g_u_wheel_vel;
 
 
     /* запас под sync */
@@ -553,8 +563,8 @@ static void ControlTorqueStep(void)
     /* 🔴 sync теперь адекватный */
     u_sync = -(CONTROL_K_SYNC * wheel_vel_diff);
 
-    /* ограничим сильнее */
-    u_sync = control_clamp(u_sync, -20.0f, 20.0f);
+    /* отдельное ограничение sync-канала */
+    u_sync = control_clamp(u_sync, -CONTROL_U_SYNC_LIMIT, CONTROL_U_SYNC_LIMIT);
 
     left_cmd = u_pd + u_sync;
     right_cmd = -u_pd - u_sync;
