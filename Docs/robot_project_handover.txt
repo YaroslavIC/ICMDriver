@@ -1,0 +1,75 @@
+
+PROJECT STATE & ISSUES (for new chat)
+
+SYSTEM:
+- Self-balancing robot (STM32 + ODrive CAN)
+- Modes: IDLE / CATCH / BALANCE
+- EKF provides pitch, pitch_rate, wheel_vel_avg, etc.
+- Debug via CDC logs
+
+CURRENT ARCHITECTURE:
+- CATCH: PD on pitch + damping via wheel velocity (intended)
+- BAL: PD + wheel velocity + sync
+- Mode switching with thresholds and hold time
+
+KEY PROBLEMS IDENTIFIED:
+
+1. CATCH damping instability
+- V term often disappears (V=0 in logs)
+- Indicates code inconsistency / patches not applied correctly
+- Causes uncontrolled base acceleration
+
+2. Early switch CATCH → BAL
+- Happens at high pitch_rate and high wheel velocity
+- Leads to immediate failure after switching
+- Needs stricter condition (rate threshold lowered)
+
+3. Base runaway (wpr growth)
+- Robot moves significantly before stabilizing
+- Sometimes partially recovers, but too late
+
+4. Torque saturation
+- u hits limit (sat=1) frequently
+- Robot cannot recover from large angles
+
+5. FALL protection failure
+- Robot fell and continued spinning wheels
+- Indicates cutoff not triggered or misplaced
+- Safety critical issue
+
+6. Code integrity issues
+- Multiple broken patches:
+  - snap.snap.wheel_vel_avg
+  - missing variables
+  - mixed debug/control logic
+- Need clean base before further tuning
+
+7. Debug issues
+- Missing newline (
+) caused unreadable logs
+- Must always enforce CRLF
+
+LAST OBSERVED BEHAVIOR:
+- Robot catches partially
+- Switches to BAL too early
+- Falls backward
+- Continues applying torque (no shutdown)
+
+CONCLUSION:
+System is close but unstable due to:
+- inconsistent code state
+- incorrect mode transition timing
+- insufficient / inconsistent damping
+- missing reliable safety cutoff
+
+NEXT CHAT GOALS:
+1. Rebuild clean ControlTorqueStep
+2. Ensure CATCH V term always active
+3. Fix mode transition logic
+4. Implement reliable FALL cutoff
+5. Then retune gains
+
+IMPORTANT RULE:
+- Only ONE change per iteration
+- Always verify via logs
+

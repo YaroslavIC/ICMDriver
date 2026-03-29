@@ -30,6 +30,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include "usbd_cdc_if.h"
+#include "app_serial.h"
+#include "flash_cfg_store.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,6 +43,40 @@ typedef enum
     CONTROL_MODE_BALANCE
 } control_mode_t;
 
+typedef struct
+{
+    float control_u_limit;
+    float control_k_pitch;
+    float control_k_pitch_rate;
+    float control_k_sync;
+    float control_u_sync_limit;
+    float vertical_pitch_thresh_mrad;
+    float vertical_rate_thresh_mrads;
+    float control_k_wheel_vel;
+    float control_pitch_trim_rad;
+    float catch2bal_pitch_th_rad;
+    float catch2bal_rate_th_rads;
+    float bal2catch_pitch_th_rad;
+    float catch_hold_ms;
+    float catch_u_limit;
+    float catch_k_pitch;
+    float catch_k_pitch_rate;
+    float catch_k_wheel_vel;
+    float fall_pitch_pos_th_rad;
+    float fall_pitch_neg_th_rad;
+} balance_runtime_cfg_t;
+
+typedef struct
+{
+    balance_runtime_cfg_t balance;
+    uint8_t control_enabled;
+    uint8_t flash_cfg_loaded;
+    uint8_t reserved0;
+    uint8_t reserved1;
+    flash_cfg_store_t flash_store;
+    app_serial_t serial;
+} app_runtime_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -50,23 +86,25 @@ typedef enum
 #define ODRV_CONTROL_MODE_TORQUE_CONTROL      1U
 #define ODRV_INPUT_MODE_PASSTHROUGH           1U
 
-#define CONTROL_U_LIMIT                       0.40f
-#define CONTROL_K_PITCH                       0.8f
-#define CONTROL_K_PITCH_RATE                  0.45f
-
-#define CONTROL_K_SYNC                        0.06f
-#define CONTROL_U_SYNC_LIMIT                  0.03f
-#define VERTICAL_PITCH_THRESH_MRAD            80
-#define VERTICAL_RATE_THRESH_MRADS            200
-
-#define CONTROL_K_WHEEL_VEL                   0.2f
-#define CONTROL_PITCH_TRIM_RAD                (0.20f)
-
-#define CATCH2BAL_PITCH_TH_rad                0.08f
-#define CATCH2BAL_RATE_TH_rads                0.80f
-#define BAL2CATCH_PITCH_TH_rad                0.16f
-#define CATCH_HOLD_MS                         200U
-
+#define BAL_CFG_CONTROL_U_LIMIT_DEFAULT             0.40f
+#define BAL_CFG_CONTROL_K_PITCH_DEFAULT             0.80f
+#define BAL_CFG_CONTROL_K_PITCH_RATE_DEFAULT        0.45f
+#define BAL_CFG_CONTROL_K_SYNC_DEFAULT              0.06f
+#define BAL_CFG_CONTROL_U_SYNC_LIMIT_DEFAULT        0.03f
+#define BAL_CFG_VERTICAL_PITCH_THRESH_MRAD_DEFAULT  80.0f
+#define BAL_CFG_VERTICAL_RATE_THRESH_MRADS_DEFAULT  200.0f
+#define BAL_CFG_CONTROL_K_WHEEL_VEL_DEFAULT         0.20f
+#define BAL_CFG_CONTROL_PITCH_TRIM_RAD_DEFAULT      0.20f
+#define BAL_CFG_CATCH2BAL_PITCH_TH_RAD_DEFAULT      0.05f
+#define BAL_CFG_CATCH2BAL_RATE_TH_RADS_DEFAULT      0.50f
+#define BAL_CFG_BAL2CATCH_PITCH_TH_RAD_DEFAULT      0.16f
+#define BAL_CFG_CATCH_HOLD_MS_DEFAULT               300.0f
+#define BAL_CFG_CATCH_U_LIMIT_DEFAULT               0.45f
+#define BAL_CFG_CATCH_K_PITCH_DEFAULT               0.52f
+#define BAL_CFG_CATCH_K_PITCH_RATE_DEFAULT          0.45f
+#define BAL_CFG_CATCH_K_WHEEL_VEL_DEFAULT           0.22f
+#define BAL_CFG_FALL_PITCH_POS_TH_RAD_DEFAULT       (750.0f / 1000.0f)
+#define BAL_CFG_FALL_PITCH_NEG_TH_RAD_DEFAULT       (-1200.0f / 1000.0f)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -110,11 +148,14 @@ static float g_vel2_raw = 0.0f;
 static float g_vel1_norm = 0.0f;
 static float g_vel2_norm = 0.0f;
 static float g_wheel_vel_diff_raw = 0.0f;
-static uint8_t g_control_enabled = 0u;
 static control_mode_t g_control_mode = CONTROL_MODE_IDLE;
 static uint32_t g_control_mode_enter_ms = 0u;
+static uint32_t g_catch_in_band_since_ms = 0u;
+static uint8_t g_catch_in_band_active = 0u;
+static float g_wheel_pos_ref = 0.0f;
 
 static can_mcp2515_odrive_t g_can_odrive;
+static app_runtime_t g_app;
 
 //static uint8_t g_started = 0U;
 //static char g_diag_line[192];
@@ -135,6 +176,14 @@ static const char *ControlModeToString(control_mode_t mode);
 static void ControlSetMode(control_mode_t mode, uint32_t now_ms);
 static void ControlUpdateMode(uint32_t now_ms, float pitch_err, float pitch_rate);
 static void ControlResetOutputs(void);
+static void AppRuntimeInit(void);
+static void AppRuntimeToFlashData(const app_runtime_t *app, flash_cfg_balance_data_t *data);
+static void AppRuntimeFromFlashData(app_runtime_t *app, const flash_cfg_balance_data_t *data);
+static app_serial_status_t AppRuntimeSaveToFlash(app_runtime_t *app);
+static app_serial_status_t AppSerialGetParam(void *ctx, app_serial_param_id_t id, float *value);
+static app_serial_status_t AppSerialSetParam(void *ctx, app_serial_param_id_t id, float value);
+static app_serial_status_t AppSerialGetEnable(void *ctx, uint8_t *enabled);
+static app_serial_status_t AppSerialSetEnable(void *ctx, uint8_t enabled);
 
 /* USER CODE END PFP */
 
@@ -167,11 +216,17 @@ static void ControlSetMode(control_mode_t mode, uint32_t now_ms)
 
     g_control_mode = mode;
     g_control_mode_enter_ms = now_ms;
+
+    if (mode != CONTROL_MODE_CATCH)
+    {
+        g_catch_in_band_since_ms = 0u;
+        g_catch_in_band_active = 0u;
+    }
 }
 
 static void ControlUpdateMode(uint32_t now_ms, float pitch_err, float pitch_rate)
 {
-    if ((g_control_enabled == 0u) || (snap.valid == 0u))
+    if ((g_app.control_enabled == 0u) || (snap.valid == 0u))
     {
         ControlSetMode(CONTROL_MODE_IDLE, now_ms);
         return;
@@ -184,16 +239,39 @@ static void ControlUpdateMode(uint32_t now_ms, float pitch_err, float pitch_rate
         break;
 
     case CONTROL_MODE_CATCH:
-        if (((uint32_t)(now_ms - g_control_mode_enter_ms) >= CATCH_HOLD_MS) &&
-            (fabsf(pitch_err) < CATCH2BAL_PITCH_TH_rad) &&
-            (fabsf(pitch_rate) < CATCH2BAL_RATE_TH_rads))
+    {
+        uint8_t in_band;
+
+        in_band = 0u;
+        if ((fabsf(pitch_err) < g_app.balance.catch2bal_pitch_th_rad) &&
+            (fabsf(pitch_rate) < g_app.balance.catch2bal_rate_th_rads))
         {
-            ControlSetMode(CONTROL_MODE_BALANCE, now_ms);
+            in_band = 1u;
+        }
+
+        if (in_band != 0u)
+        {
+            if (g_catch_in_band_active == 0u)
+            {
+                g_catch_in_band_active = 1u;
+                g_catch_in_band_since_ms = now_ms;
+            }
+
+            if ((float)((uint32_t)(now_ms - g_catch_in_band_since_ms)) >= g_app.balance.catch_hold_ms)
+            {
+                ControlSetMode(CONTROL_MODE_BALANCE, now_ms);
+            }
+        }
+        else
+        {
+            g_catch_in_band_active = 0u;
+            g_catch_in_band_since_ms = 0u;
         }
         break;
+    }
 
     case CONTROL_MODE_BALANCE:
-        if (fabsf(pitch_err) > BAL2CATCH_PITCH_TH_rad)
+        if (fabsf(pitch_err) > g_app.balance.bal2catch_pitch_th_rad)
         {
             ControlSetMode(CONTROL_MODE_CATCH, now_ms);
         }
@@ -217,6 +295,242 @@ static void ControlResetOutputs(void)
     g_vel1_norm = 0.0f;
     g_vel2_norm = 0.0f;
     g_wheel_vel_diff_raw = 0.0f;
+}
+
+static void AppRuntimeToFlashData(const app_runtime_t *app, flash_cfg_balance_data_t *data)
+{
+    if ((app == NULL) || (data == NULL))
+    {
+        return;
+    }
+
+    data->control_u_limit = app->balance.control_u_limit;
+    data->control_k_pitch = app->balance.control_k_pitch;
+    data->control_k_pitch_rate = app->balance.control_k_pitch_rate;
+    data->control_k_sync = app->balance.control_k_sync;
+    data->control_u_sync_limit = app->balance.control_u_sync_limit;
+    data->vertical_pitch_thresh_mrad = app->balance.vertical_pitch_thresh_mrad;
+    data->vertical_rate_thresh_mrads = app->balance.vertical_rate_thresh_mrads;
+    data->control_k_wheel_vel = app->balance.control_k_wheel_vel;
+    data->control_pitch_trim_rad = app->balance.control_pitch_trim_rad;
+    data->catch2bal_pitch_th_rad = app->balance.catch2bal_pitch_th_rad;
+    data->catch2bal_rate_th_rads = app->balance.catch2bal_rate_th_rads;
+    data->bal2catch_pitch_th_rad = app->balance.bal2catch_pitch_th_rad;
+    data->catch_hold_ms = app->balance.catch_hold_ms;
+    data->catch_u_limit = app->balance.catch_u_limit;
+    data->catch_k_pitch = app->balance.catch_k_pitch;
+    data->catch_k_pitch_rate = app->balance.catch_k_pitch_rate;
+    data->catch_k_wheel_vel = app->balance.catch_k_wheel_vel;
+    data->fall_pitch_pos_th_rad = app->balance.fall_pitch_pos_th_rad;
+    data->fall_pitch_neg_th_rad = app->balance.fall_pitch_neg_th_rad;
+}
+
+static void AppRuntimeFromFlashData(app_runtime_t *app, const flash_cfg_balance_data_t *data)
+{
+    if ((app == NULL) || (data == NULL))
+    {
+        return;
+    }
+
+    app->balance.control_u_limit = data->control_u_limit;
+    app->balance.control_k_pitch = data->control_k_pitch;
+    app->balance.control_k_pitch_rate = data->control_k_pitch_rate;
+    app->balance.control_k_sync = data->control_k_sync;
+    app->balance.control_u_sync_limit = data->control_u_sync_limit;
+    app->balance.vertical_pitch_thresh_mrad = data->vertical_pitch_thresh_mrad;
+    app->balance.vertical_rate_thresh_mrads = data->vertical_rate_thresh_mrads;
+    app->balance.control_k_wheel_vel = data->control_k_wheel_vel;
+    app->balance.control_pitch_trim_rad = data->control_pitch_trim_rad;
+    app->balance.catch2bal_pitch_th_rad = data->catch2bal_pitch_th_rad;
+    app->balance.catch2bal_rate_th_rads = data->catch2bal_rate_th_rads;
+    app->balance.bal2catch_pitch_th_rad = data->bal2catch_pitch_th_rad;
+    app->balance.catch_hold_ms = data->catch_hold_ms;
+    app->balance.catch_u_limit = data->catch_u_limit;
+    app->balance.catch_k_pitch = data->catch_k_pitch;
+    app->balance.catch_k_pitch_rate = data->catch_k_pitch_rate;
+    app->balance.catch_k_wheel_vel = data->catch_k_wheel_vel;
+    app->balance.fall_pitch_pos_th_rad = data->fall_pitch_pos_th_rad;
+    app->balance.fall_pitch_neg_th_rad = data->fall_pitch_neg_th_rad;
+}
+
+static app_serial_status_t AppRuntimeSaveToFlash(app_runtime_t *app)
+{
+    flash_cfg_balance_data_t data;
+
+    if (app == NULL)
+    {
+        return APP_SERIAL_STATUS_BAD_ARG;
+    }
+
+    AppRuntimeToFlashData(app, &data);
+    if (flash_cfg_store_save(&app->flash_store, &data) != FLASH_CFG_STORE_STATUS_OK)
+    {
+        return APP_SERIAL_STATUS_ERROR;
+    }
+
+    return APP_SERIAL_STATUS_OK;
+}
+
+static void AppRuntimeInit(void)
+{
+    flash_cfg_balance_data_t flash_data;
+
+    memset(&g_app, 0, sizeof(g_app));
+
+    g_app.balance.control_u_limit = BAL_CFG_CONTROL_U_LIMIT_DEFAULT;
+    g_app.balance.control_k_pitch = BAL_CFG_CONTROL_K_PITCH_DEFAULT;
+    g_app.balance.control_k_pitch_rate = BAL_CFG_CONTROL_K_PITCH_RATE_DEFAULT;
+    g_app.balance.control_k_sync = BAL_CFG_CONTROL_K_SYNC_DEFAULT;
+    g_app.balance.control_u_sync_limit = BAL_CFG_CONTROL_U_SYNC_LIMIT_DEFAULT;
+    g_app.balance.vertical_pitch_thresh_mrad = BAL_CFG_VERTICAL_PITCH_THRESH_MRAD_DEFAULT;
+    g_app.balance.vertical_rate_thresh_mrads = BAL_CFG_VERTICAL_RATE_THRESH_MRADS_DEFAULT;
+    g_app.balance.control_k_wheel_vel = BAL_CFG_CONTROL_K_WHEEL_VEL_DEFAULT;
+    g_app.balance.control_pitch_trim_rad = BAL_CFG_CONTROL_PITCH_TRIM_RAD_DEFAULT;
+    g_app.balance.catch2bal_pitch_th_rad = BAL_CFG_CATCH2BAL_PITCH_TH_RAD_DEFAULT;
+    g_app.balance.catch2bal_rate_th_rads = BAL_CFG_CATCH2BAL_RATE_TH_RADS_DEFAULT;
+    g_app.balance.bal2catch_pitch_th_rad = BAL_CFG_BAL2CATCH_PITCH_TH_RAD_DEFAULT;
+    g_app.balance.catch_hold_ms = BAL_CFG_CATCH_HOLD_MS_DEFAULT;
+    g_app.balance.catch_u_limit = BAL_CFG_CATCH_U_LIMIT_DEFAULT;
+    g_app.balance.catch_k_pitch = BAL_CFG_CATCH_K_PITCH_DEFAULT;
+    g_app.balance.catch_k_pitch_rate = BAL_CFG_CATCH_K_PITCH_RATE_DEFAULT;
+    g_app.balance.catch_k_wheel_vel = BAL_CFG_CATCH_K_WHEEL_VEL_DEFAULT;
+    g_app.balance.fall_pitch_pos_th_rad = BAL_CFG_FALL_PITCH_POS_TH_RAD_DEFAULT;
+    g_app.balance.fall_pitch_neg_th_rad = BAL_CFG_FALL_PITCH_NEG_TH_RAD_DEFAULT;
+    g_app.control_enabled = 0u;
+
+    (void)flash_cfg_store_init(&g_app.flash_store);
+    if (flash_cfg_store_load(&g_app.flash_store, &flash_data) == FLASH_CFG_STORE_STATUS_OK)
+    {
+        AppRuntimeFromFlashData(&g_app, &flash_data);
+        g_app.flash_cfg_loaded = 1u;
+    }
+
+    g_app.serial.get_param = AppSerialGetParam;
+    g_app.serial.set_param = AppSerialSetParam;
+    g_app.serial.get_enable = AppSerialGetEnable;
+    g_app.serial.set_enable = AppSerialSetEnable;
+    g_app.serial.user_ctx = &g_app;
+    (void)app_serial_init(&g_app.serial);
+}
+
+static app_serial_status_t AppSerialGetParam(void *ctx, app_serial_param_id_t id, float *value)
+{
+    app_runtime_t *app;
+
+    if ((ctx == NULL) || (value == NULL))
+    {
+        return APP_SERIAL_STATUS_BAD_ARG;
+    }
+
+    app = (app_runtime_t *)ctx;
+
+    switch (id)
+    {
+    case APP_SERIAL_PARAM_CONTROL_U_LIMIT: *value = app->balance.control_u_limit; break;
+    case APP_SERIAL_PARAM_CONTROL_K_PITCH: *value = app->balance.control_k_pitch; break;
+    case APP_SERIAL_PARAM_CONTROL_K_PITCH_RATE: *value = app->balance.control_k_pitch_rate; break;
+    case APP_SERIAL_PARAM_CONTROL_K_SYNC: *value = app->balance.control_k_sync; break;
+    case APP_SERIAL_PARAM_CONTROL_U_SYNC_LIMIT: *value = app->balance.control_u_sync_limit; break;
+    case APP_SERIAL_PARAM_VERTICAL_PITCH_THRESH_MRAD: *value = app->balance.vertical_pitch_thresh_mrad; break;
+    case APP_SERIAL_PARAM_VERTICAL_RATE_THRESH_MRADS: *value = app->balance.vertical_rate_thresh_mrads; break;
+    case APP_SERIAL_PARAM_CONTROL_K_WHEEL_VEL: *value = app->balance.control_k_wheel_vel; break;
+    case APP_SERIAL_PARAM_CONTROL_PITCH_TRIM_RAD: *value = app->balance.control_pitch_trim_rad; break;
+    case APP_SERIAL_PARAM_CATCH2BAL_PITCH_TH_RAD: *value = app->balance.catch2bal_pitch_th_rad; break;
+    case APP_SERIAL_PARAM_CATCH2BAL_RATE_TH_RADS: *value = app->balance.catch2bal_rate_th_rads; break;
+    case APP_SERIAL_PARAM_BAL2CATCH_PITCH_TH_RAD: *value = app->balance.bal2catch_pitch_th_rad; break;
+    case APP_SERIAL_PARAM_CATCH_HOLD_MS: *value = app->balance.catch_hold_ms; break;
+    case APP_SERIAL_PARAM_CATCH_U_LIMIT: *value = app->balance.catch_u_limit; break;
+    case APP_SERIAL_PARAM_CATCH_K_PITCH: *value = app->balance.catch_k_pitch; break;
+    case APP_SERIAL_PARAM_CATCH_K_PITCH_RATE: *value = app->balance.catch_k_pitch_rate; break;
+    case APP_SERIAL_PARAM_CATCH_K_WHEEL_VEL: *value = app->balance.catch_k_wheel_vel; break;
+    case APP_SERIAL_PARAM_FALL_PITCH_POS_TH_RAD: *value = app->balance.fall_pitch_pos_th_rad; break;
+    case APP_SERIAL_PARAM_FALL_PITCH_NEG_TH_RAD: *value = app->balance.fall_pitch_neg_th_rad; break;
+    default:
+        return APP_SERIAL_STATUS_BAD_PARAM;
+    }
+
+    return APP_SERIAL_STATUS_OK;
+}
+
+static app_serial_status_t AppSerialSetParam(void *ctx, app_serial_param_id_t id, float value)
+{
+    app_runtime_t *app;
+    balance_runtime_cfg_t prev_cfg;
+
+    if (ctx == NULL)
+    {
+        return APP_SERIAL_STATUS_BAD_ARG;
+    }
+
+    app = (app_runtime_t *)ctx;
+    prev_cfg = app->balance;
+
+    switch (id)
+    {
+    case APP_SERIAL_PARAM_CONTROL_U_LIMIT: app->balance.control_u_limit = value; break;
+    case APP_SERIAL_PARAM_CONTROL_K_PITCH: app->balance.control_k_pitch = value; break;
+    case APP_SERIAL_PARAM_CONTROL_K_PITCH_RATE: app->balance.control_k_pitch_rate = value; break;
+    case APP_SERIAL_PARAM_CONTROL_K_SYNC: app->balance.control_k_sync = value; break;
+    case APP_SERIAL_PARAM_CONTROL_U_SYNC_LIMIT: app->balance.control_u_sync_limit = value; break;
+    case APP_SERIAL_PARAM_VERTICAL_PITCH_THRESH_MRAD: app->balance.vertical_pitch_thresh_mrad = value; break;
+    case APP_SERIAL_PARAM_VERTICAL_RATE_THRESH_MRADS: app->balance.vertical_rate_thresh_mrads = value; break;
+    case APP_SERIAL_PARAM_CONTROL_K_WHEEL_VEL: app->balance.control_k_wheel_vel = value; break;
+    case APP_SERIAL_PARAM_CONTROL_PITCH_TRIM_RAD: app->balance.control_pitch_trim_rad = value; break;
+    case APP_SERIAL_PARAM_CATCH2BAL_PITCH_TH_RAD: app->balance.catch2bal_pitch_th_rad = value; break;
+    case APP_SERIAL_PARAM_CATCH2BAL_RATE_TH_RADS: app->balance.catch2bal_rate_th_rads = value; break;
+    case APP_SERIAL_PARAM_BAL2CATCH_PITCH_TH_RAD: app->balance.bal2catch_pitch_th_rad = value; break;
+    case APP_SERIAL_PARAM_CATCH_HOLD_MS:
+        if (value < 0.0f)
+        {
+            return APP_SERIAL_STATUS_BAD_VALUE;
+        }
+        app->balance.catch_hold_ms = value;
+        break;
+    case APP_SERIAL_PARAM_CATCH_U_LIMIT: app->balance.catch_u_limit = value; break;
+    case APP_SERIAL_PARAM_CATCH_K_PITCH: app->balance.catch_k_pitch = value; break;
+    case APP_SERIAL_PARAM_CATCH_K_PITCH_RATE: app->balance.catch_k_pitch_rate = value; break;
+    case APP_SERIAL_PARAM_CATCH_K_WHEEL_VEL: app->balance.catch_k_wheel_vel = value; break;
+    case APP_SERIAL_PARAM_FALL_PITCH_POS_TH_RAD: app->balance.fall_pitch_pos_th_rad = value; break;
+    case APP_SERIAL_PARAM_FALL_PITCH_NEG_TH_RAD: app->balance.fall_pitch_neg_th_rad = value; break;
+    default:
+        return APP_SERIAL_STATUS_BAD_PARAM;
+    }
+
+    if (AppRuntimeSaveToFlash(app) != APP_SERIAL_STATUS_OK)
+    {
+        app->balance = prev_cfg;
+        return APP_SERIAL_STATUS_ERROR;
+    }
+
+    return APP_SERIAL_STATUS_OK;
+}
+
+static app_serial_status_t AppSerialGetEnable(void *ctx, uint8_t *enabled)
+{
+    app_runtime_t *app;
+
+    if ((ctx == NULL) || (enabled == NULL))
+    {
+        return APP_SERIAL_STATUS_BAD_ARG;
+    }
+
+    app = (app_runtime_t *)ctx;
+    *enabled = app->control_enabled;
+    return APP_SERIAL_STATUS_OK;
+}
+
+static app_serial_status_t AppSerialSetEnable(void *ctx, uint8_t enabled)
+{
+    app_runtime_t *app;
+
+    if (ctx == NULL)
+    {
+        return APP_SERIAL_STATUS_BAD_ARG;
+    }
+
+    app = (app_runtime_t *)ctx;
+    app->control_enabled = (enabled != 0u) ? 1u : 0u;
+    return APP_SERIAL_STATUS_OK;
 }
 
 void IMUService(void) {
@@ -313,8 +627,8 @@ static void VerticalLedStep(const ekf_state_snapshot_t *state)
     pitch_abs = (pitch_mrad >= 0) ? pitch_mrad : -pitch_mrad;
     rate_abs = (rate_mrads >= 0) ? rate_mrads : -rate_mrads;
 
-    if ((pitch_abs <= VERTICAL_PITCH_THRESH_MRAD) &&
-        (rate_abs <= VERTICAL_RATE_THRESH_MRADS))
+    if ((pitch_abs <= g_app.balance.vertical_pitch_thresh_mrad) &&
+        (rate_abs <= g_app.balance.vertical_rate_thresh_mrads))
     {
         HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
     }
@@ -328,11 +642,24 @@ static void DebugTelemetryStep(void)
 {
     static uint32_t last_dbg_ms = 0u;
     uint32_t now_ms;
+    float pitch_err;
+    float p_term;
+    float d_term;
+    float v_term;
+    float u_raw;
+    float u_clamped;
+    float kp_dbg;
+    float kd_dbg;
+    float ks_dbg;
+    float wp;
+    float wpr;
 
     int32_t pitch_mrad;
     int32_t rate_mrads;
     int32_t wv_x1000;
     int32_t wd_x1000;
+    int32_t wp_x1000;
+    int32_t wpr_x1000;
 
     int32_t p_x1000;
     int32_t d_x1000;
@@ -364,32 +691,61 @@ static void DebugTelemetryStep(void)
     rate_mrads = (int32_t)(snap.pitch_rate_rad_s * 1000.0f);
     wv_x1000 = (int32_t)(snap.wheel_vel_avg * 1000.0f);
     wd_x1000 = (int32_t)(snap.wheel_vel_diff * 1000.0f);
+    wp = snap.wheel_pos_avg;
+    wpr = snap.wheel_pos_avg - g_wheel_pos_ref;
+    wp_x1000 = (int32_t)(wp * 1000.0f);
+    wpr_x1000 = (int32_t)(wpr * 1000.0f);
 
-    /* === P и D компоненты === */
-    float pitch_err = snap.pitch_rad + CONTROL_PITCH_TRIM_RAD;
-    float p_term = (CONTROL_K_PITCH * pitch_err);
-    float d_term = (CONTROL_K_PITCH_RATE * snap.pitch_rate_rad_s);
-    float v_term = -(CONTROL_K_WHEEL_VEL * snap.wheel_vel_avg);
-    float u_pd_raw = p_term + d_term + v_term;
+    pitch_err = snap.pitch_rad + g_app.balance.control_pitch_trim_rad;
 
-    float u_pd_clamped = control_clamp(u_pd_raw,
-                                       -(CONTROL_U_LIMIT - CONTROL_U_SYNC_LIMIT),
-                                       +(CONTROL_U_LIMIT - CONTROL_U_SYNC_LIMIT));
+    if (g_control_mode == CONTROL_MODE_CATCH)
+    {
+        p_term = g_app.balance.catch_k_pitch * pitch_err;
+        d_term = g_app.balance.catch_k_pitch_rate * snap.pitch_rate_rad_s;
+        v_term = -(g_app.balance.catch_k_wheel_vel * snap.wheel_vel_avg);
+        u_raw = p_term + d_term + v_term;
+        u_clamped = control_clamp(u_raw, -g_app.balance.catch_u_limit, +g_app.balance.catch_u_limit);
+        kp_dbg = g_app.balance.catch_k_pitch;
+        kd_dbg = g_app.balance.catch_k_pitch_rate;
+        ks_dbg = 0.0f;
+    }
+    else if (g_control_mode == CONTROL_MODE_BALANCE)
+    {
+        p_term = g_app.balance.control_k_pitch * pitch_err;
+        d_term = g_app.balance.control_k_pitch_rate * snap.pitch_rate_rad_s;
+        v_term = -(g_app.balance.control_k_wheel_vel * snap.wheel_vel_avg);
+        u_raw = p_term + d_term + v_term;
+        u_clamped = control_clamp(u_raw,
+                                  -(g_app.balance.control_u_limit - g_app.balance.control_u_sync_limit),
+                                  +(g_app.balance.control_u_limit - g_app.balance.control_u_sync_limit));
+        kp_dbg = g_app.balance.control_k_pitch;
+        kd_dbg = g_app.balance.control_k_pitch_rate;
+        ks_dbg = g_app.balance.control_k_sync;
+    }
+    else
+    {
+        p_term = 0.0f;
+        d_term = 0.0f;
+        v_term = 0.0f;
+        u_raw = 0.0f;
+        u_clamped = 0.0f;
+        kp_dbg = 0.0f;
+        kd_dbg = 0.0f;
+        ks_dbg = 0.0f;
+    }
 
     p_x1000 = (int32_t)(p_term * 1000.0f);
     d_x1000 = (int32_t)(d_term * 1000.0f);
-    u_pd_raw_x1000 = (int32_t)(u_pd_raw * 1000.0f);
-    u_pd_clamped_x1000 = (int32_t)(u_pd_clamped * 1000.0f);
-    vterm_x1000 = (int32_t)(g_u_wheel_vel * 1000.0f);
+    u_pd_raw_x1000 = (int32_t)(u_raw * 1000.0f);
+    u_pd_clamped_x1000 = (int32_t)(u_clamped * 1000.0f);
+    vterm_x1000 = (int32_t)(v_term * 1000.0f);
 
-    /* === SATURATION FLAG === */
-    if ((u_pd_raw > u_pd_clamped + 1e-6f) ||
-        (u_pd_raw < u_pd_clamped - 1e-6f))
+    if ((u_raw > u_clamped + 1e-6f) ||
+        (u_raw < u_clamped - 1e-6f))
     {
         sat_flag = 1u;
     }
 
-    /* === остальное как было === */
     u_x1000 = (int32_t)(g_torque_cmd * 1000.0f);
     usync_x1000 = (int32_t)(g_u_sync * 1000.0f);
     l_x1000 = (int32_t)(g_left_cmd * 1000.0f);
@@ -405,13 +761,13 @@ static void DebugTelemetryStep(void)
         "DBG t=%lu en=%u valid=%u mode=%s "
         "pitch=%ld rate=%ld "
         "P=%ld D=%ld V=%ld raw=%ld clamp=%ld sat=%u "
-        "wv=%ld wd=%ld "
+        "wv=%ld wd=%ld wp=%ld wpr=%ld "
         "v1=%ld v2=%ld v1n=%ld v2n=%ld wdr=%ld "
         "u=%ld usync=%ld L=%ld R=%ld "
         "Kp=%ld Kd=%ld Ks=%ld\r\n",
 
         (unsigned long)now_ms,
-        (unsigned)g_control_enabled,
+        (unsigned)g_app.control_enabled,
         (unsigned)snap.valid,
         ControlModeToString(g_control_mode),
 
@@ -427,6 +783,8 @@ static void DebugTelemetryStep(void)
 
         (long)wv_x1000,
         (long)wd_x1000,
+        (long)wp_x1000,
+        (long)wpr_x1000,
 
         (long)v1raw_x1000,
         (long)v2raw_x1000,
@@ -439,9 +797,9 @@ static void DebugTelemetryStep(void)
         (long)l_x1000,
         (long)r_x1000,
 
-        (long)(CONTROL_K_PITCH * 1000.0f),
-        (long)(CONTROL_K_PITCH_RATE * 1000.0f),
-        (long)(CONTROL_K_SYNC * 1000.0f)
+        (long)(kp_dbg * 1000.0f),
+        (long)(kd_dbg * 1000.0f),
+        (long)(ks_dbg * 1000.0f)
     );
 }
 
@@ -584,7 +942,7 @@ static void ControlTorqueStep(void)
     uint32_t now_ms;
     float pitch_err;
     float pitch_rate;
-    float u_pd;
+    float u_cmd;
     float u_sync;
     float left_cmd;
     float right_cmd;
@@ -594,67 +952,90 @@ static void ControlTorqueStep(void)
 
     now_ms = HAL_GetTick();
 
-    if ((g_control_enabled == 0u) || (snap.valid == 0u))
+    if ((snap.pitch_rad > g_app.balance.fall_pitch_pos_th_rad) ||
+        (snap.pitch_rad < g_app.balance.fall_pitch_neg_th_rad))
     {
         ControlSetMode(CONTROL_MODE_IDLE, now_ms);
+        g_wheel_pos_ref = snap.wheel_pos_avg;
         ControlResetOutputs();
         (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
         return;
     }
 
-    /* RAW скорости */
+    if ((g_app.control_enabled == 0u) || (snap.valid == 0u))
+    {
+        ControlSetMode(CONTROL_MODE_IDLE, now_ms);
+        g_wheel_pos_ref = snap.wheel_pos_avg;
+        ControlResetOutputs();
+        (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
+        return;
+    }
+
     g_vel1_raw = g_can_odrive.pair.vel1;
     g_vel2_raw = g_can_odrive.pair.vel2;
 
     vel1 = g_vel1_raw;
     vel2 = -g_vel2_raw;
 
-    /* ограничение скорости (анти-разнос) */
     vel1 = control_clamp(vel1, -1500.0f, 1500.0f);
     vel2 = control_clamp(vel2, -1500.0f, 1500.0f);
 
-    /* Разница скоростей */
-    wheel_vel_diff = 0.5f * (vel1 - vel2);
+    wheel_vel_diff = snap.wheel_vel_diff;
 
     g_vel1_norm = vel1;
     g_vel2_norm = vel2;
     g_wheel_vel_diff_raw = wheel_vel_diff;
 
-    pitch_err = snap.pitch_rad + CONTROL_PITCH_TRIM_RAD;
+    pitch_err = snap.pitch_rad + g_app.balance.control_pitch_trim_rad;
     pitch_rate = snap.pitch_rate_rad_s;
 
     ControlUpdateMode(now_ms, pitch_err, pitch_rate);
 
     if (g_control_mode == CONTROL_MODE_IDLE)
     {
+        g_wheel_pos_ref = snap.wheel_pos_avg;
         ControlResetOutputs();
         (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
         return;
     }
 
-    g_u_wheel_vel = -(CONTROL_K_WHEEL_VEL * snap.wheel_vel_avg);
+    if (g_control_mode == CONTROL_MODE_CATCH)
+    {
+        g_u_wheel_vel = -(g_app.balance.catch_k_wheel_vel * snap.wheel_vel_avg);
 
-    u_pd = (CONTROL_K_PITCH * pitch_err) +
-           (CONTROL_K_PITCH_RATE * pitch_rate) +
-           g_u_wheel_vel;
+        u_cmd = g_app.balance.catch_k_pitch * pitch_err
+              + g_app.balance.catch_k_pitch_rate * pitch_rate
+              + g_u_wheel_vel;
 
-    /* запас под sync */
-    u_pd = control_clamp(u_pd,
-                         -(CONTROL_U_LIMIT - CONTROL_U_SYNC_LIMIT),
-                         +(CONTROL_U_LIMIT - CONTROL_U_SYNC_LIMIT));
+        u_cmd = control_clamp(u_cmd, -g_app.balance.catch_u_limit, +g_app.balance.catch_u_limit);
+        u_sync = 0.0f;
 
-    u_sync = -(CONTROL_K_SYNC * wheel_vel_diff);
+        left_cmd = u_cmd;
+        right_cmd = -u_cmd;
+    }
+    else
+    {
+        g_u_wheel_vel = -(g_app.balance.control_k_wheel_vel * snap.wheel_vel_avg);
 
-    /* отдельное ограничение sync-канала */
-    u_sync = control_clamp(u_sync, -CONTROL_U_SYNC_LIMIT, CONTROL_U_SYNC_LIMIT);
+        u_cmd = (g_app.balance.control_k_pitch * pitch_err) +
+                (g_app.balance.control_k_pitch_rate * pitch_rate) +
+                g_u_wheel_vel;
 
-    left_cmd = u_pd + u_sync;
-    right_cmd = -u_pd - u_sync;
+        u_cmd = control_clamp(u_cmd,
+                              -(g_app.balance.control_u_limit - g_app.balance.control_u_sync_limit),
+                              +(g_app.balance.control_u_limit - g_app.balance.control_u_sync_limit));
 
-    left_cmd = control_clamp(left_cmd, -CONTROL_U_LIMIT, CONTROL_U_LIMIT);
-    right_cmd = control_clamp(right_cmd, -CONTROL_U_LIMIT, CONTROL_U_LIMIT);
+        u_sync = -(g_app.balance.control_k_sync * wheel_vel_diff);
+        u_sync = control_clamp(u_sync, -g_app.balance.control_u_sync_limit, g_app.balance.control_u_sync_limit);
 
-    g_torque_cmd = u_pd;
+        left_cmd = u_cmd + u_sync;
+        right_cmd = -u_cmd - u_sync;
+
+        left_cmd = control_clamp(left_cmd, -g_app.balance.control_u_limit, g_app.balance.control_u_limit);
+        right_cmd = control_clamp(right_cmd, -g_app.balance.control_u_limit, g_app.balance.control_u_limit);
+    }
+
+    g_torque_cmd = u_cmd;
     g_u_sync = u_sync;
     g_left_cmd = left_cmd;
     g_right_cmd = right_cmd;
@@ -700,6 +1081,7 @@ int main(void)
   MX_TIM11_Init();
   /* USER CODE BEGIN 2 */
 
+  AppRuntimeInit();
 
   imu_init();
 
@@ -708,7 +1090,7 @@ int main(void)
   EKF_init();
 
   HAL_TIM_Base_Start_IT(&htim11);
-
+  (void)app_serial_printf(&g_app.serial, "RSP ready\r\n");
 
   /* USER CODE END 2 */
 
@@ -724,6 +1106,7 @@ int main(void)
 	    ekf_driver_process_pending(&g_ekf);
 	    ekf_driver_get_state_snapshot(&g_ekf, &snap);
 	    VerticalLedStep(&snap);
+	    app_serial_process(&g_app.serial);
 	    DebugTelemetryStep();
 
 	    if (g_ctrl_step_pending != 0u)

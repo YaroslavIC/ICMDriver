@@ -55,3 +55,14 @@
 /Debug/**/*.*
 !Debug/*.elf
 /Debug/
+/Docs/robot_presets/current.json
+/Docs/robot_presets/preset_20260328_163620.json
+/Docs/robot_presets/preset_20260328_222138.json
+/Docs/robot_presets/preset_20260328_222219.json
+/Docs/robot_presets/preset_20260328_222229.json
+/Docs/robot_presets/preset_20260328_222454.json
+/Docs/robot_presets/preset_20260328_222459.json
+/Docs/robot_presets/preset_20260328_223635.json
+/Docs/robot_presets/preset_20260328_223725.json
+/Docs/robot_presets/preset_20260328_224303.json
+/Docs/*.zip
