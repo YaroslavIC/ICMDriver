@@ -145,7 +145,12 @@ flash_cfg_store_status_t flash_cfg_store_save(flash_cfg_store_t *store, const fl
     image.crc32 = flash_cfg_store_crc32_calc((const uint8_t *)&image,
                                              (uint32_t)(sizeof(image) - sizeof(uint32_t)));
 
-    HAL_FLASH_Unlock();
+    if (HAL_FLASH_Unlock() != HAL_OK)
+    {
+        store->dbg.last_flash_error = HAL_FLASH_GetError();
+        store->dbg.last_error = (uint32_t)FLASH_CFG_STORE_STATUS_FLASH_ERROR;
+        return FLASH_CFG_STORE_STATUS_FLASH_ERROR;
+    }
 
     memset(&erase, 0, sizeof(erase));
     erase.TypeErase = FLASH_TYPEERASE_SECTORS;
@@ -183,7 +188,12 @@ flash_cfg_store_status_t flash_cfg_store_save(flash_cfg_store_t *store, const fl
         address += sizeof(uint32_t);
     }
 
-    (void)HAL_FLASH_Lock();
+    if (HAL_FLASH_Lock() != HAL_OK)
+    {
+        store->dbg.last_flash_error = HAL_FLASH_GetError();
+        store->dbg.last_error = (uint32_t)FLASH_CFG_STORE_STATUS_FLASH_ERROR;
+        return FLASH_CFG_STORE_STATUS_FLASH_ERROR;
+    }
 
     image_rd = (const flash_cfg_store_image_t *)FLASH_CFG_STORE_BASE_ADDRESS;
     status = flash_cfg_store_validate_image(store, image_rd);

@@ -9,18 +9,19 @@ extern "C" {
 #include <stdint.h>
 #include <stdarg.h>
 
-// Версия: 01.00 28.03.26 12:15:00
+// Версия: 01.01 29.03.26 13:10:00
 // Назначение:
-// Простой USB CDC интерфейс команд для настройки коэффициентов балансировки.
-// Модуль принимает ASCII строки, разбирает команды и отправляет ответы.
+// Простой USB CDC интерфейс команд для настройки коэффициентов балансировки
+// и команд движения. Модуль принимает ASCII строки, разбирает команды и
+// отправляет ответы.
 //
 // Пример инициализации:
 // app_runtime_t app;
 // memset(&app, 0, sizeof(app));
-// app.serial.get_param = AppSerialGetParam;
-// app.serial.set_param = AppSerialSetParam;
-// app.serial.get_enable = AppSerialGetEnable;
-// app.serial.set_enable = AppSerialSetEnable;
+// app.serial.get_param = hardwareinit_serial_get_param;
+// app.serial.set_param = hardwareinit_serial_set_param;
+// app.serial.get_enable = hardwareinit_serial_get_enable;
+// app.serial.set_enable = hardwareinit_serial_set_enable;
 // app.serial.user_ctx = &app;
 // app_serial_init(&app.serial);
 //
@@ -33,8 +34,10 @@ extern "C" {
 // Команды:
 // help
 // get all
-// get catch_k_pitch
-// set catch_k_pitch 0.54
+// get balance_target_pitch_rad
+// set control_k_wheel_pos 0.060
+// set motion_fwd_cmd 0.200
+// set motion_turn_cmd -0.150
 // en 1
 
 typedef enum
@@ -55,12 +58,14 @@ typedef enum
     APP_SERIAL_PARAM_CONTROL_U_LIMIT = 0,
     APP_SERIAL_PARAM_CONTROL_K_PITCH,
     APP_SERIAL_PARAM_CONTROL_K_PITCH_RATE,
+    APP_SERIAL_PARAM_CONTROL_K_WHEEL_VEL,
+    APP_SERIAL_PARAM_CONTROL_K_WHEEL_POS,
     APP_SERIAL_PARAM_CONTROL_K_SYNC,
     APP_SERIAL_PARAM_CONTROL_U_SYNC_LIMIT,
     APP_SERIAL_PARAM_VERTICAL_PITCH_THRESH_MRAD,
     APP_SERIAL_PARAM_VERTICAL_RATE_THRESH_MRADS,
-    APP_SERIAL_PARAM_CONTROL_K_WHEEL_VEL,
-    APP_SERIAL_PARAM_CONTROL_PITCH_TRIM_RAD,
+    APP_SERIAL_PARAM_IMU_PITCH_ZERO_OFFSET_RAD,
+    APP_SERIAL_PARAM_BALANCE_TARGET_PITCH_RAD,
     APP_SERIAL_PARAM_CATCH2BAL_PITCH_TH_RAD,
     APP_SERIAL_PARAM_CATCH2BAL_RATE_TH_RADS,
     APP_SERIAL_PARAM_BAL2CATCH_PITCH_TH_RAD,
@@ -69,8 +74,14 @@ typedef enum
     APP_SERIAL_PARAM_CATCH_K_PITCH,
     APP_SERIAL_PARAM_CATCH_K_PITCH_RATE,
     APP_SERIAL_PARAM_CATCH_K_WHEEL_VEL,
+    APP_SERIAL_PARAM_CATCH_K_WHEEL_POS,
     APP_SERIAL_PARAM_FALL_PITCH_POS_TH_RAD,
     APP_SERIAL_PARAM_FALL_PITCH_NEG_TH_RAD,
+    APP_SERIAL_PARAM_MOTION_PITCH_BIAS_PER_CMD_RAD,
+    APP_SERIAL_PARAM_MOTION_CMD_RATE_PER_S,
+    APP_SERIAL_PARAM_MOTION_TURN_U_LIMIT,
+    APP_SERIAL_PARAM_MOTION_FWD_CMD,
+    APP_SERIAL_PARAM_MOTION_TURN_CMD,
     APP_SERIAL_PARAM_COUNT
 } app_serial_param_id_t;
 

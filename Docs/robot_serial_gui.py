@@ -31,7 +31,7 @@ except Exception:
     OPENAI_AVAILABLE = False
 
 
-APP_VERSION = "v9.0.5"
+APP_VERSION = "v10.0.0"
 
 DBG_PATTERN = re.compile(
     r"DBG\s+.*?\bt=(?P<t>-?\d+).*?"
@@ -52,12 +52,14 @@ PARAM_NAMES = [
     "control_u_limit",
     "control_k_pitch",
     "control_k_pitch_rate",
+    "control_k_wheel_vel",
+    "control_k_wheel_pos",
     "control_k_sync",
     "control_u_sync_limit",
     "vertical_pitch_thresh_mrad",
     "vertical_rate_thresh_mrads",
-    "control_k_wheel_vel",
-    "control_pitch_trim_rad",
+    "imu_pitch_zero_offset_rad",
+    "balance_target_pitch_rad",
     "catch2bal_pitch_th_rad",
     "catch2bal_rate_th_rads",
     "bal2catch_pitch_th_rad",
@@ -66,8 +68,14 @@ PARAM_NAMES = [
     "catch_k_pitch",
     "catch_k_pitch_rate",
     "catch_k_wheel_vel",
+    "catch_k_wheel_pos",
     "fall_pitch_pos_th_rad",
     "fall_pitch_neg_th_rad",
+    "motion_pitch_bias_per_cmd_rad",
+    "motion_cmd_rate_per_s",
+    "motion_turn_u_limit",
+    "motion_fwd_cmd",
+    "motion_turn_cmd",
 ]
 
 
