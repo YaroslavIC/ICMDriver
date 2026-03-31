@@ -7,18 +7,18 @@ extern "C" {
 
 #include "main.h"
 #include "balance.h"
+#include "balance_calibration.h"
 #include <stdint.h>
 
-// Версия: 01.01 29.03.26 13:10:00
+// Версия: 01.02 31.03.26 19:35:00
 // Назначение:
-// Драйвер хранения коэффициентов балансировки во Flash STM32F401CCU6.
-// Модуль хранит одну структуру с заголовком, счетчиком записи и CRC32.
-// После старта можно восстановить последние сохраненные коэффициенты.
-// После изменения коэффициентов можно выполнить запись во Flash.
+// Драйвер хранения коэффициентов балансировки и результатов калибровки во
+// Flash STM32F401CCU6. Модуль хранит одну структуру с заголовком, счетчиком
+// записи и CRC32.
 //
 // Пример инициализации:
 // flash_cfg_store_t cfg_store;
-// flash_cfg_balance_data_t flash_data;
+// flash_cfg_data_t flash_data;
 // memset(&cfg_store, 0, sizeof(cfg_store));
 // if (flash_cfg_store_init(&cfg_store) != FLASH_CFG_STORE_STATUS_OK)
 // {
@@ -26,25 +26,21 @@ extern "C" {
 // }
 // if (flash_cfg_store_load(&cfg_store, &flash_data) == FLASH_CFG_STORE_STATUS_OK)
 // {
-//     // перенести flash_data в рабочую структуру коэффициентов
-// }
-//
-// Пример сохранения:
-// flash_cfg_balance_data_t flash_data;
-// заполнить flash_data из runtime структуры
-// if (flash_cfg_store_save(&cfg_store, &flash_data) != FLASH_CFG_STORE_STATUS_OK)
-// {
-//     // обработка ошибки записи
+//     // перенести flash_data в runtime
 // }
 
 #define FLASH_CFG_STORE_BASE_ADDRESS            0x08020000u
 #define FLASH_CFG_STORE_FLASH_SECTOR            FLASH_SECTOR_5
 #define FLASH_CFG_STORE_FLASH_BANK              FLASH_BANK_1
 #define FLASH_CFG_STORE_MAGIC                   0x31474643u
-#define FLASH_CFG_STORE_FORMAT_VERSION          0x0002u
+#define FLASH_CFG_STORE_FORMAT_VERSION          0x0003u
 #define FLASH_CFG_STORE_MAX_WRITE_RETRY         1u
 
-typedef balance_params_t flash_cfg_balance_data_t;
+typedef struct
+{
+    balance_params_t balance_params;
+    balance_calibration_persist_t calibration;
+} flash_cfg_data_t;
 
 typedef enum
 {
@@ -80,8 +76,8 @@ typedef struct
 } flash_cfg_store_t;
 
 flash_cfg_store_status_t flash_cfg_store_init(flash_cfg_store_t *store);
-flash_cfg_store_status_t flash_cfg_store_load(flash_cfg_store_t *store, flash_cfg_balance_data_t *data);
-flash_cfg_store_status_t flash_cfg_store_save(flash_cfg_store_t *store, const flash_cfg_balance_data_t *data);
+flash_cfg_store_status_t flash_cfg_store_load(flash_cfg_store_t *store, flash_cfg_data_t *data);
+flash_cfg_store_status_t flash_cfg_store_save(flash_cfg_store_t *store, const flash_cfg_data_t *data);
 
 #ifdef __cplusplus
 }

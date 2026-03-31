@@ -9,7 +9,7 @@ extern "C" {
 #include <stdint.h>
 #include <stdarg.h>
 
-// Версия: 01.01 29.03.26 13:10:00
+// Версия: 01.02 31.03.26 19:35:00
 // Назначение:
 // Простой USB CDC интерфейс команд для настройки коэффициентов балансировки
 // и команд движения. Модуль принимает ASCII строки, разбирает команды и
@@ -91,6 +91,7 @@ typedef app_serial_status_t (*app_serial_get_param_fn)(void *ctx, app_serial_par
 typedef app_serial_status_t (*app_serial_set_param_fn)(void *ctx, app_serial_param_id_t id, float value);
 typedef app_serial_status_t (*app_serial_get_enable_fn)(void *ctx, uint8_t *enabled);
 typedef app_serial_status_t (*app_serial_set_enable_fn)(void *ctx, uint8_t enabled);
+typedef app_serial_status_t (*app_serial_custom_cmd_fn)(app_serial_t *serial, void *ctx, const char *line, uint8_t *handled);
 
 #define APP_SERIAL_RX_FIFO_SIZE          256u
 #define APP_SERIAL_LINE_SIZE             128u
@@ -104,6 +105,8 @@ typedef struct app_serial_s
     app_serial_get_enable_fn get_enable;
     app_serial_set_enable_fn set_enable;
     void *user_ctx;
+    app_serial_custom_cmd_fn custom_cmd;
+    void *custom_ctx;
 
     volatile uint16_t rx_wr;
     volatile uint16_t rx_rd;

@@ -63,12 +63,10 @@ static app_serial_status_t app_serial_try_send(app_serial_t *serial, const char 
     {
         return APP_SERIAL_STATUS_OK;
     }
-
     if (tx_status == USBD_BUSY)
     {
         return APP_SERIAL_STATUS_BUSY;
     }
-
     return APP_SERIAL_STATUS_ERROR;
 }
 
@@ -158,6 +156,7 @@ static app_serial_status_t app_serial_handle_line(app_serial_t *serial)
     int parsed;
     app_serial_param_id_t id;
     int n;
+    app_serial_status_t status;
 
     if (serial == NULL)
     {
@@ -172,7 +171,7 @@ static app_serial_status_t app_serial_handle_line(app_serial_t *serial)
 
     if (strcmp(cmd, "help") == 0)
     {
-        n = snprintf(serial->tx_line, sizeof(serial->tx_line), "RSP help: get all | get <name> | set <name> <value> | en <0|1>\r\n");
+        n = snprintf(serial->tx_line, sizeof(serial->tx_line), "RSP help: get all | get <name> | set <name> <value> | en <0|1> | CALIB_START | CALIB_ABORT | CALIB_GET\r\n");
         if ((n <= 0) || (n >= (int)sizeof(serial->tx_line)))
         {
             return APP_SERIAL_STATUS_ERROR;
@@ -247,6 +246,18 @@ static app_serial_status_t app_serial_handle_line(app_serial_t *serial)
         return app_serial_send_enable(serial);
     }
 
+    if (serial->custom_cmd != NULL)
+    {
+        uint8_t handled;
+
+        handled = 0u;
+        status = serial->custom_cmd(serial, serial->custom_ctx, serial->line_buf, &handled);
+        if (handled != 0u)
+        {
+            return status;
+        }
+    }
+
     return app_serial_printf(serial, "ERR unknown_cmd\r\n");
 }
 
@@ -262,7 +273,11 @@ app_serial_status_t app_serial_init(app_serial_t *serial)
     serial->line_len = 0u;
     serial->dump_active = 0u;
     serial->tx_busy = 0u;
+    serial->reserved0 = 0u;
+    serial->reserved1 = 0u;
     serial->dump_index = 0u;
+    serial->custom_cmd = NULL;
+    serial->custom_ctx = NULL;
     memset(serial->rx_fifo, 0, sizeof(serial->rx_fifo));
     memset(serial->line_buf, 0, sizeof(serial->line_buf));
     memset(serial->tx_line, 0, sizeof(serial->tx_line));

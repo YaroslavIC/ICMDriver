@@ -7,7 +7,7 @@ typedef struct
     uint32_t version;
     uint32_t size;
     uint32_t counter;
-    flash_cfg_balance_data_t data;
+    flash_cfg_data_t data;
     uint32_t crc32;
 } flash_cfg_store_image_t;
 
@@ -67,7 +67,7 @@ static flash_cfg_store_status_t flash_cfg_store_validate_image(flash_cfg_store_t
         return FLASH_CFG_STORE_STATUS_BAD_VERSION;
     }
 
-    if (image->size != (uint32_t)sizeof(flash_cfg_balance_data_t))
+    if (image->size != (uint32_t)sizeof(flash_cfg_data_t))
     {
         return FLASH_CFG_STORE_STATUS_BAD_SIZE;
     }
@@ -94,7 +94,7 @@ flash_cfg_store_status_t flash_cfg_store_init(flash_cfg_store_t *store)
     return FLASH_CFG_STORE_STATUS_OK;
 }
 
-flash_cfg_store_status_t flash_cfg_store_load(flash_cfg_store_t *store, flash_cfg_balance_data_t *data)
+flash_cfg_store_status_t flash_cfg_store_load(flash_cfg_store_t *store, flash_cfg_data_t *data)
 {
     const flash_cfg_store_image_t *image;
     flash_cfg_store_status_t status;
@@ -119,7 +119,7 @@ flash_cfg_store_status_t flash_cfg_store_load(flash_cfg_store_t *store, flash_cf
     return FLASH_CFG_STORE_STATUS_OK;
 }
 
-flash_cfg_store_status_t flash_cfg_store_save(flash_cfg_store_t *store, const flash_cfg_balance_data_t *data)
+flash_cfg_store_status_t flash_cfg_store_save(flash_cfg_store_t *store, const flash_cfg_data_t *data)
 {
     flash_cfg_store_image_t image;
     const flash_cfg_store_image_t *image_rd;

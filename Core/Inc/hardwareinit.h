@@ -7,29 +7,16 @@ extern "C" {
 
 #include "main.h"
 #include "balance.h"
+#include "balance_calibration.h"
 #include "flash_cfg_store.h"
 #include "app_serial.h"
 #include <stdint.h>
 
-// Версия: 01.00 29.03.26 13:05:00
+// Версия: 01.01 31.03.26 19:35:00
 // Назначение:
 // Модуль инициализации приложения. Хранит рабочую структуру проекта,
 // заполняет параметры по умолчанию, загружает коэффициенты из Flash,
-// подключает serial callbacks и предоставляет единое API доступа к
-// параметрам балансировки и командам движения.
-//
-// Пример инициализации:
-// app_runtime_t app;
-// if (hardwareinit_runtime_init(&app) != HARDWAREINIT_STATUS_OK)
-// {
-//     Error_Handler();
-// }
-//
-// Пример сохранения:
-// if (hardwareinit_save_to_flash(&app) != HARDWAREINIT_STATUS_OK)
-// {
-//     // обработка ошибки
-// }
+// результаты калибровки и подключает serial callbacks.
 
 typedef enum
 {
@@ -44,9 +31,10 @@ typedef struct
 {
     balance_controller_t balance;
     balance_command_t command;
+    balance_calibration_persist_t calib_data;
     uint8_t control_enabled;
     uint8_t flash_cfg_loaded;
-    uint8_t reserved0;
+    uint8_t calib_loaded;
     uint8_t reserved1;
     flash_cfg_store_t flash_store;
     app_serial_t serial;

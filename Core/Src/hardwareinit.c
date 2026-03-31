@@ -1,24 +1,28 @@
 #include "hardwareinit.h"
 #include <string.h>
 
-static void hardwareinit_balance_to_flash(const app_runtime_t *app, flash_cfg_balance_data_t *data)
+static void hardwareinit_runtime_to_flash(const app_runtime_t *app, flash_cfg_data_t *data)
 {
     if ((app == NULL) || (data == NULL))
     {
         return;
     }
 
-    *data = app->balance.params;
+    memset(data, 0, sizeof(*data));
+    data->balance_params = app->balance.params;
+    data->calibration = app->calib_data;
 }
 
-static void hardwareinit_balance_from_flash(app_runtime_t *app, const flash_cfg_balance_data_t *data)
+static void hardwareinit_runtime_from_flash(app_runtime_t *app, const flash_cfg_data_t *data)
 {
     if ((app == NULL) || (data == NULL))
     {
         return;
     }
 
-    app->balance.params = *data;
+    app->balance.params = data->balance_params;
+    app->calib_data = data->calibration;
+    app->calib_loaded = ((app->calib_data.flags & BALANCE_CALIBRATION_FLAG_VALID) != 0u) ? 1u : 0u;
 }
 
 static uint8_t hardwareinit_param_is_persistent(app_serial_param_id_t id)
@@ -36,7 +40,7 @@ static uint8_t hardwareinit_param_is_persistent(app_serial_param_id_t id)
 
 hardwareinit_status_t hardwareinit_runtime_init(app_runtime_t *app)
 {
-    flash_cfg_balance_data_t flash_data;
+    flash_cfg_data_t flash_data;
 
     if (app == NULL)
     {
@@ -61,7 +65,7 @@ hardwareinit_status_t hardwareinit_runtime_init(app_runtime_t *app)
 
     if (flash_cfg_store_load(&app->flash_store, &flash_data) == FLASH_CFG_STORE_STATUS_OK)
     {
-        hardwareinit_balance_from_flash(app, &flash_data);
+        hardwareinit_runtime_from_flash(app, &flash_data);
         app->flash_cfg_loaded = 1u;
     }
 
@@ -80,14 +84,14 @@ hardwareinit_status_t hardwareinit_runtime_init(app_runtime_t *app)
 
 hardwareinit_status_t hardwareinit_save_to_flash(app_runtime_t *app)
 {
-    flash_cfg_balance_data_t data;
+    flash_cfg_data_t data;
 
     if (app == NULL)
     {
         return HARDWAREINIT_STATUS_BAD_ARG;
     }
 
-    hardwareinit_balance_to_flash(app, &data);
+    hardwareinit_runtime_to_flash(app, &data);
     if (flash_cfg_store_save(&app->flash_store, &data) != FLASH_CFG_STORE_STATUS_OK)
     {
         return HARDWAREINIT_STATUS_FLASH_ERROR;

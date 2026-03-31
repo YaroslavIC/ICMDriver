@@ -34,6 +34,7 @@
 #include "flash_cfg_store.h"
 #include "balance.h"
 #include "hardwareinit.h"
+#include "balance_calibration.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -81,6 +82,7 @@ static volatile uint64_t g_ctrl_step_ts_us = 0ull;
 static can_mcp2515_odrive_t g_can_odrive;
 static app_runtime_t g_app;
 static balance_output_t g_balance_out;
+static balance_calibration_t g_balance_cal;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -95,6 +97,16 @@ static void MX_TIM11_Init(void);
 static void VerticalLedStep(const ekf_state_snapshot_t *state);
 static void DebugTelemetryStep(void);
 static void ControlTorqueStep(void);
+static void app_log_line_cb(void *ctx, const char *line);
+static float app_get_left_vel_cb(void *ctx);
+static float app_get_right_vel_cb(void *ctx);
+static balance_calibration_status_t app_set_pair_torque_cb(void *ctx, float u_left, float u_right);
+static uint8_t app_are_axes_ready_cb(void *ctx);
+static uint8_t app_has_errors_cb(void *ctx);
+static uint8_t app_is_control_enabled_cb(void *ctx);
+static balance_calibration_status_t app_set_control_enabled_cb(void *ctx, uint8_t value);
+static balance_calibration_status_t app_save_calibration_cb(void *ctx, const balance_calibration_persist_t *persist);
+static app_serial_status_t app_serial_custom_cmd_cb(app_serial_t *serial, void *ctx, const char *line, uint8_t *handled);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -146,6 +158,168 @@ static void app_debug_printf(const char *fmt, ...)
     }
 
     (void)CDC_Transmit_FS((uint8_t *)buf, (uint16_t)n);
+}
+
+static void app_log_line_cb(void *ctx, const char *line)
+{
+    (void)ctx;
+    if (line == NULL)
+    {
+        return;
+    }
+    app_debug_printf("%s\r\n", line);
+}
+
+static float app_get_left_vel_cb(void *ctx)
+{
+    (void)ctx;
+    return g_can_odrive.pair.vel1;
+}
+
+static float app_get_right_vel_cb(void *ctx)
+{
+    (void)ctx;
+    return g_can_odrive.pair.vel2;
+}
+
+static balance_calibration_status_t app_set_pair_torque_cb(void *ctx, float u_left, float u_right)
+{
+    (void)ctx;
+    if (odrive_pair_set_input_torque(&g_can_odrive, u_left, u_right) != CAN_MCP2515_ODRIVE_STATUS_OK)
+    {
+        return BALANCE_CALIBRATION_STATUS_ERROR;
+    }
+    return BALANCE_CALIBRATION_STATUS_OK;
+}
+
+static uint8_t app_are_axes_ready_cb(void *ctx)
+{
+    (void)ctx;
+    if ((g_can_odrive.node1.heartbeat.valid == 0u) || (g_can_odrive.node2.heartbeat.valid == 0u))
+    {
+        return 0u;
+    }
+    if ((g_can_odrive.node1.heartbeat.axis_state != ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL) ||
+        (g_can_odrive.node2.heartbeat.axis_state != ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL))
+    {
+        return 0u;
+    }
+    return 1u;
+}
+
+static uint8_t app_has_errors_cb(void *ctx)
+{
+    (void)ctx;
+    if ((g_can_odrive.node1.heartbeat.axis_error != 0u) || (g_can_odrive.node2.heartbeat.axis_error != 0u))
+    {
+        return 1u;
+    }
+    if ((g_can_odrive.node1.error.valid != 0u) && (g_can_odrive.node1.error.active_errors != 0u))
+    {
+        return 1u;
+    }
+    if ((g_can_odrive.node2.error.valid != 0u) && (g_can_odrive.node2.error.active_errors != 0u))
+    {
+        return 1u;
+    }
+    return 0u;
+}
+
+static uint8_t app_is_control_enabled_cb(void *ctx)
+{
+    app_runtime_t *app;
+
+    app = (app_runtime_t *)ctx;
+    if (app == NULL)
+    {
+        return 0u;
+    }
+    return app->control_enabled;
+}
+
+static balance_calibration_status_t app_set_control_enabled_cb(void *ctx, uint8_t value)
+{
+    app_runtime_t *app;
+
+    app = (app_runtime_t *)ctx;
+    if (app == NULL)
+    {
+        return BALANCE_CALIBRATION_STATUS_BAD_ARG;
+    }
+
+    app->control_enabled = (value != 0u) ? 1u : 0u;
+    if (app->control_enabled == 0u)
+    {
+        app->command.motion_fwd_cmd = 0.0f;
+        app->command.motion_turn_cmd = 0.0f;
+        (void)balance_reset(&app->balance, snap.wheel_pos_avg, HAL_GetTick());
+    }
+
+    return BALANCE_CALIBRATION_STATUS_OK;
+}
+
+static balance_calibration_status_t app_save_calibration_cb(void *ctx, const balance_calibration_persist_t *persist)
+{
+    app_runtime_t *app;
+
+    app = (app_runtime_t *)ctx;
+    if ((app == NULL) || (persist == NULL))
+    {
+        return BALANCE_CALIBRATION_STATUS_BAD_ARG;
+    }
+
+    app->calib_data = *persist;
+    app->calib_loaded = 1u;
+    if (hardwareinit_save_to_flash(app) != HARDWAREINIT_STATUS_OK)
+    {
+        return BALANCE_CALIBRATION_STATUS_FLASH_ERROR;
+    }
+    return BALANCE_CALIBRATION_STATUS_OK;
+}
+
+static app_serial_status_t app_serial_custom_cmd_cb(app_serial_t *serial, void *ctx, const char *line, uint8_t *handled)
+{
+    app_runtime_t *app;
+
+    if ((serial == NULL) || (ctx == NULL) || (line == NULL) || (handled == NULL))
+    {
+        return APP_SERIAL_STATUS_BAD_ARG;
+    }
+
+    *handled = 0u;
+    app = (app_runtime_t *)ctx;
+
+    if (strcmp(line, "CALIB_START") == 0)
+    {
+        *handled = 1u;
+        if (balance_calibration_is_active(&g_balance_cal) != 0u)
+        {
+            return app_serial_printf(serial, "ERR calib_busy\r\n");
+        }
+        if (balance_calibration_start(&g_balance_cal, HAL_GetTick()) != BALANCE_CALIBRATION_STATUS_OK)
+        {
+            return app_serial_printf(serial, "ERR calib_start_failed\r\n");
+        }
+        return app_serial_printf(serial, "RSP calib=start\r\n");
+    }
+
+    if (strcmp(line, "CALIB_ABORT") == 0)
+    {
+        *handled = 1u;
+        balance_calibration_abort(&g_balance_cal);
+        return app_serial_printf(serial, "RSP calib=abort_req\r\n");
+    }
+
+    if (strcmp(line, "CALIB_GET") == 0)
+    {
+        *handled = 1u;
+        app_log_line_cb(app, "CALSTAT phase=GET_FLASH state=RUN");
+        balance_calibration_emit_persist(&g_balance_cal, &app->calib_data);
+        app_log_line_cb(app, "CALSTAT phase=GET_FLASH state=OK");
+        return APP_SERIAL_STATUS_OK;
+    }
+
+    return APP_SERIAL_STATUS_EMPTY;
 }
 
 static void VerticalLedStep(const ekf_state_snapshot_t *state)
@@ -377,6 +551,11 @@ static void ControlTorqueStep(void)
     in.control_enabled = g_app.control_enabled;
     in.now_ms = HAL_GetTick();
 
+    if (balance_calibration_is_active(&g_balance_cal) != 0u)
+    {
+        return;
+    }
+
     if (balance_step(&g_app.balance, &in, &g_app.command, &g_balance_out) != BALANCE_STATUS_OK)
     {
         (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
@@ -441,6 +620,22 @@ int main(void)
   odrive_full_init();
 
   EKF_init();
+
+  g_app.serial.custom_cmd = app_serial_custom_cmd_cb;
+  g_app.serial.custom_ctx = &g_app;
+
+  balance_calibration_init(&g_balance_cal, NULL);
+  g_balance_cal.io.user_ctx = &g_app;
+  g_balance_cal.io.get_left_vel = app_get_left_vel_cb;
+  g_balance_cal.io.get_right_vel = app_get_right_vel_cb;
+  g_balance_cal.io.set_torque = app_set_pair_torque_cb;
+  g_balance_cal.io.are_axes_ready = app_are_axes_ready_cb;
+  g_balance_cal.io.has_errors = app_has_errors_cb;
+  g_balance_cal.io.is_control_enabled = app_is_control_enabled_cb;
+  g_balance_cal.io.set_control_enabled = app_set_control_enabled_cb;
+  g_balance_cal.io.log_line = app_log_line_cb;
+  g_balance_cal.io.save_persist = app_save_calibration_cb;
+  balance_calibration_set_persist(&g_balance_cal, &g_app.calib_data);
 
   HAL_TIM_Base_Start_IT(&htim11);
   (void)app_serial_printf(&g_app.serial, "RSP ready\r\n");
