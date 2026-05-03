@@ -169,6 +169,7 @@ typedef struct
 
 typedef void (*balance_calibration_log_line_fn)(void *ctx, const char *line);
 typedef float (*balance_calibration_get_vel_fn)(void *ctx);
+typedef float (*balance_calibration_get_pos_fn)(void *ctx);
 typedef balance_calibration_status_t (*balance_calibration_set_torque_fn)(void *ctx, float u_left, float u_right);
 typedef uint8_t (*balance_calibration_get_flag_fn)(void *ctx);
 typedef balance_calibration_status_t (*balance_calibration_set_flag_fn)(void *ctx, uint8_t value);
@@ -179,6 +180,8 @@ typedef struct
     void *user_ctx;
     balance_calibration_get_vel_fn get_left_vel;
     balance_calibration_get_vel_fn get_right_vel;
+    balance_calibration_get_pos_fn get_left_pos;
+    balance_calibration_get_pos_fn get_right_pos;
     balance_calibration_set_torque_fn set_torque;
     balance_calibration_get_flag_fn are_axes_ready;
     balance_calibration_get_flag_fn has_errors;
@@ -202,6 +205,9 @@ typedef struct
     uint32_t step_index;
     float vel_avg_sum;
     uint32_t vel_avg_count;
+    float pos_start;
+    float pos_last;
+    float vel_peak_abs;
     uint8_t moved_latched;
     int32_t t_move_ms;
 } balance_calibration_runtime_t;

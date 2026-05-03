@@ -834,6 +834,12 @@ ekf_status_t ekf_driver_get_state_snapshot(ekf_driver_t *dev, ekf_state_snapshot
     out->wheel_vel_avg = dev->state.x[3];
     out->wheel_pos_diff = dev->state.x[4];
     out->wheel_vel_diff = dev->state.x[5];
+    out->wheel_pos_left_raw = dev->last_meas.pos1;
+    out->wheel_vel_left_raw = dev->last_meas.vel1;
+    out->wheel_pos_right_raw = dev->last_meas.pos2;
+    out->wheel_vel_right_raw = dev->last_meas.vel2;
+    out->wheel_left_raw_ts_us = dev->hist.odrv1.curr.ts_us;
+    out->wheel_right_raw_ts_us = dev->hist.odrv2.curr.ts_us;
     out->step_count = dev->state.step_count;
     out->valid = dev->state.valid;
 

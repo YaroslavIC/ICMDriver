@@ -5,7 +5,10 @@
 extern "C" {
 #endif
 
+#define BALANCE_MODULE_VERSION           "B11"
+
 #include "main.h"
+// Версия 10.10 05.04.26 12:05:00
 #include <stdint.h>
 
 // Версия: 01.00 29.03.26 12:55:00
@@ -57,6 +60,9 @@ typedef enum
     BALANCE_MODE_SAFE_STOP
 } balance_mode_t;
 
+
+
+
 typedef struct
 {
     float control_u_limit;
@@ -72,6 +78,12 @@ typedef struct
     float imu_pitch_zero_offset_rad;
     float balance_target_pitch_rad;
 
+    float target_trim_limit_rad;
+    float target_trim_rate_rad_s;
+    float target_trim_err_gate_rad;
+    float target_trim_rate_gate_rads;
+    float target_trim_u_gate;
+
     float catch2bal_pitch_th_rad;
     float catch2bal_rate_th_rads;
     float bal2catch_pitch_th_rad;
@@ -81,6 +93,7 @@ typedef struct
     float catch_k_pitch_rate;
     float catch_k_wheel_vel;
     float catch_k_wheel_pos;
+    float catch_drive_u;
 
     float fall_pitch_pos_th_rad;
     float fall_pitch_neg_th_rad;
@@ -118,6 +131,9 @@ typedef struct
     float wheel_pos_ref;
     float motion_fwd_cmd_cur;
     float motion_turn_cmd_cur;
+    float target_trim_rad;
+    float trim_u_avg;
+    float trim_pitch_err_avg;
     uint8_t catch_in_band_active;
     uint8_t reserved1;
     uint16_t reserved2;
@@ -158,8 +174,8 @@ typedef struct
 } balance_controller_t;
 
 #define BALANCE_CONTROL_U_LIMIT_DEFAULT             0.40f
-#define BALANCE_CONTROL_K_PITCH_DEFAULT             0.80f
-#define BALANCE_CONTROL_K_PITCH_RATE_DEFAULT        0.45f
+#define BALANCE_CONTROL_K_PITCH_DEFAULT             1.00f
+#define BALANCE_CONTROL_K_PITCH_RATE_DEFAULT        0.60f
 #define BALANCE_CONTROL_K_WHEEL_VEL_DEFAULT         0.20f
 #define BALANCE_CONTROL_K_WHEEL_POS_DEFAULT         0.06f
 #define BALANCE_CONTROL_K_SYNC_DEFAULT              0.06f
@@ -168,15 +184,21 @@ typedef struct
 #define BALANCE_VERTICAL_RATE_THRESH_MRADS_DEFAULT  200.0f
 #define BALANCE_IMU_PITCH_ZERO_OFFSET_RAD_DEFAULT   0.00f
 #define BALANCE_TARGET_PITCH_RAD_DEFAULT            0.20f
+#define BALANCE_TARGET_TRIM_LIMIT_RAD_DEFAULT       0.060f
+#define BALANCE_TARGET_TRIM_RATE_RAD_S_DEFAULT      0.050f
+#define BALANCE_TARGET_TRIM_ERR_GATE_RAD_DEFAULT    0.150f
+#define BALANCE_TARGET_TRIM_RATE_GATE_RADS_DEFAULT  0.500f
+#define BALANCE_TARGET_TRIM_U_GATE_DEFAULT          80.0f
 #define BALANCE_CATCH2BAL_PITCH_TH_RAD_DEFAULT      0.05f
 #define BALANCE_CATCH2BAL_RATE_TH_RADS_DEFAULT      0.50f
 #define BALANCE_BAL2CATCH_PITCH_TH_RAD_DEFAULT      0.16f
 #define BALANCE_CATCH_HOLD_MS_DEFAULT               300.0f
 #define BALANCE_CATCH_U_LIMIT_DEFAULT               0.45f
-#define BALANCE_CATCH_K_PITCH_DEFAULT               0.52f
-#define BALANCE_CATCH_K_PITCH_RATE_DEFAULT          0.45f
-#define BALANCE_CATCH_K_WHEEL_VEL_DEFAULT           0.22f
-#define BALANCE_CATCH_K_WHEEL_POS_DEFAULT           0.03f
+#define BALANCE_CATCH_K_PITCH_DEFAULT               0.60f
+#define BALANCE_CATCH_K_PITCH_RATE_DEFAULT          0.70f
+#define BALANCE_CATCH_K_WHEEL_VEL_DEFAULT           0.06f
+#define BALANCE_CATCH_K_WHEEL_POS_DEFAULT           0.00f
+#define BALANCE_CATCH_DRIVE_U_DEFAULT               0.45f
 #define BALANCE_FALL_PITCH_POS_TH_RAD_DEFAULT       (750.0f / 1000.0f)
 #define BALANCE_FALL_PITCH_NEG_TH_RAD_DEFAULT       (-1200.0f / 1000.0f)
 #define BALANCE_MOTION_PITCH_BIAS_PER_CMD_DEFAULT   0.06f

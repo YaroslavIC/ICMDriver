@@ -1,0 +1,1 @@
+c:\Users\HeroPC\git\AI\tests\.venvVS_314\.venv\Scripts\python.exe  C:\Users\HeroPC\git\STM32\ICMDriver\Docs\robot_serial_gui.py

@@ -10,7 +10,7 @@ extern "C" {
 #include "balance_calibration.h"
 #include <stdint.h>
 
-// Версия: 01.02 31.03.26 19:35:00
+// Версия: 01.03 05.04.26 07:10:00
 // Назначение:
 // Драйвер хранения коэффициентов балансировки и результатов калибровки во
 // Flash STM32F401CCU6. Модуль хранит одну структуру с заголовком, счетчиком
@@ -33,7 +33,7 @@ extern "C" {
 #define FLASH_CFG_STORE_FLASH_SECTOR            FLASH_SECTOR_5
 #define FLASH_CFG_STORE_FLASH_BANK              FLASH_BANK_1
 #define FLASH_CFG_STORE_MAGIC                   0x31474643u
-#define FLASH_CFG_STORE_FORMAT_VERSION          0x0003u
+#define FLASH_CFG_STORE_FORMAT_VERSION          0x0005u
 #define FLASH_CFG_STORE_MAX_WRITE_RETRY         1u
 
 typedef struct

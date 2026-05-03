@@ -5,6 +5,8 @@
 extern "C" {
 #endif
 
+#define HARDWAREINIT_MODULE_VERSION      "H05"
+
 #include "main.h"
 #include "balance.h"
 #include "balance_calibration.h"
@@ -12,7 +14,7 @@ extern "C" {
 #include "app_serial.h"
 #include <stdint.h>
 
-// Версия: 01.01 31.03.26 19:35:00
+// Версия: 01.02 05.04.26 07:10:00
 // Назначение:
 // Модуль инициализации приложения. Хранит рабочую структуру проекта,
 // заполняет параметры по умолчанию, загружает коэффициенты из Flash,

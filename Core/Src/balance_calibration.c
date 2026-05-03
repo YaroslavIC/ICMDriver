@@ -113,6 +113,41 @@ static float balance_calibration_get_active_vel(balance_calibration_t *cal)
     return cal->io.get_right_vel(cal->io.user_ctx);
 }
 
+static float balance_calibration_get_active_pos(balance_calibration_t *cal, uint8_t *ok)
+{
+    if (ok != NULL)
+    {
+        *ok = 0u;
+    }
+    if (cal == NULL)
+    {
+        return 0.0f;
+    }
+
+    if (cal->rt.wheel == BALANCE_CALIBRATION_WHEEL_LEFT)
+    {
+        if (cal->io.get_left_pos == NULL)
+        {
+            return 0.0f;
+        }
+        if (ok != NULL)
+        {
+            *ok = 1u;
+        }
+        return cal->io.get_left_pos(cal->io.user_ctx);
+    }
+
+    if (cal->io.get_right_pos == NULL)
+    {
+        return 0.0f;
+    }
+    if (ok != NULL)
+    {
+        *ok = 1u;
+    }
+    return cal->io.get_right_pos(cal->io.user_ctx);
+}
+
 static void balance_calibration_apply_torque(balance_calibration_t *cal, float u_cmd)
 {
     float u_left;
@@ -161,11 +196,15 @@ static void balance_calibration_prepare_step(balance_calibration_t *cal, uint32_
     cal->rt.point_start_ms = now_ms;
     cal->rt.avg_window_start_ms = now_ms;
     cal->rt.move_detect_start_ms = 0u;
+    uint8_t pos_ok;
     cal->rt.vel_avg_sum = 0.0f;
     cal->rt.vel_avg_count = 0u;
+    cal->rt.vel_peak_abs = 0.0f;
     cal->rt.moved_latched = 0u;
     cal->rt.t_move_ms = -1;
     cal->rt.step_index++;
+    cal->rt.pos_start = balance_calibration_get_active_pos(cal, &pos_ok);
+    cal->rt.pos_last = cal->rt.pos_start;
 
     if ((cal->state == BALANCE_CALIBRATION_STATE_L_POS_SEARCH) ||
         (cal->state == BALANCE_CALIBRATION_STATE_L_NEG_SEARCH) ||
@@ -626,6 +665,10 @@ void balance_calibration_process(balance_calibration_t *cal, uint32_t now_ms)
     float vel_cur;
     float vel_abs;
     float vel_avg;
+    float pos_cur;
+    float delta_pos;
+    float vel_from_pos;
+    uint8_t pos_ok;
     uint32_t elapsed_ms;
     balance_calibration_dir_result_t *dir_res;
     balance_calibration_point_t *pt;
@@ -742,15 +785,28 @@ void balance_calibration_process(balance_calibration_t *cal, uint32_t now_ms)
 
     balance_calibration_apply_torque(cal, cal->rt.u_current);
 
+    elapsed_ms = now_ms - cal->rt.point_start_ms;
     vel_cur = balance_calibration_get_active_vel(cal);
+    pos_cur = balance_calibration_get_active_pos(cal, &pos_ok);
+    if ((pos_ok != 0u) && (elapsed_ms > 0u))
+    {
+        delta_pos = pos_cur - cal->rt.pos_start;
+        vel_from_pos = delta_pos / ((float)elapsed_ms * 0.001f);
+        vel_cur = vel_from_pos;
+        cal->rt.pos_last = pos_cur;
+    }
     vel_abs = fabsf(vel_cur);
+    if (vel_abs > cal->rt.vel_peak_abs)
+    {
+        cal->rt.vel_peak_abs = vel_abs;
+    }
     if ((now_ms - cal->rt.point_start_ms) >= (cal->cfg.hold_ms_search > cal->cfg.avg_window_ms ? (cal->cfg.hold_ms_search - cal->cfg.avg_window_ms) : 0u))
     {
         cal->rt.vel_avg_sum += vel_cur;
         cal->rt.vel_avg_count++;
     }
 
-    if (vel_abs >= cal->cfg.vel_thresh_move)
+    if ((vel_abs >= cal->cfg.vel_thresh_move) || (cal->rt.vel_peak_abs >= (cal->cfg.vel_thresh_move * 1.5f)))
     {
         if (cal->rt.move_detect_start_ms == 0u)
         {
@@ -767,7 +823,6 @@ void balance_calibration_process(balance_calibration_t *cal, uint32_t now_ms)
         cal->rt.move_detect_start_ms = 0u;
     }
 
-    elapsed_ms = now_ms - cal->rt.point_start_ms;
     if ((cal->state == BALANCE_CALIBRATION_STATE_L_POS_SEARCH) ||
         (cal->state == BALANCE_CALIBRATION_STATE_L_NEG_SEARCH) ||
         (cal->state == BALANCE_CALIBRATION_STATE_R_POS_SEARCH) ||

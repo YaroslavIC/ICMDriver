@@ -75,6 +75,7 @@ static uint32_t g_started = 0U;
 static uint32_t g_last_diag_ms = 0U;
 static uint32_t g_last_cmd_ms  = 0U;
 static uint32_t g_test_start_ms = 0U;
+static uint32_t g_last_cal_encoder_req_ms = 0U;
 
 static volatile uint8_t g_ctrl_step_pending = 0u;
 static volatile uint64_t g_ctrl_step_ts_us = 0ull;
@@ -111,6 +112,9 @@ static app_serial_status_t app_serial_custom_cmd_cb(app_serial_t *serial, void *
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#define MAIN_MODULE_VERSION                 "M04"
+#define PROJECT_BALANCE_DEBUG_REVISION  MAIN_MODULE_VERSION "-" BALANCE_MODULE_VERSION "-" HARDWAREINIT_MODULE_VERSION "-" APP_SERIAL_MODULE_VERSION "-" EKF_DRIVER_MODULE_VERSION
+
 void IMUService(void)
 {
     (void)ICM20948_Service(&imu);
@@ -173,12 +177,24 @@ static void app_log_line_cb(void *ctx, const char *line)
 static float app_get_left_vel_cb(void *ctx)
 {
     (void)ctx;
+
+    if (snap.valid != 0u)
+    {
+        return snap.wheel_vel_left_raw;
+    }
+
     return g_can_odrive.pair.vel1;
 }
 
 static float app_get_right_vel_cb(void *ctx)
 {
     (void)ctx;
+
+    if (snap.valid != 0u)
+    {
+        return snap.wheel_vel_right_raw;
+    }
+
     return g_can_odrive.pair.vel2;
 }
 
@@ -355,22 +371,25 @@ static void DebugTelemetryStep(void)
 {
     static uint32_t last_dbg_ms = 0u;
     uint32_t now_ms;
+    uint32_t dbg_period_ms;
 
     now_ms = HAL_GetTick();
-    if ((uint32_t)(now_ms - last_dbg_ms) < 100u)
+    dbg_period_ms = (g_app.control_enabled != 0u) ? 50u : 250u;
+    if ((uint32_t)(now_ms - last_dbg_ms) < dbg_period_ms)
     {
         return;
     }
     last_dbg_ms = now_ms;
 
     app_debug_printf(
-        "DBG t=%lu en=%u valid=%u mode=%s "
-        "pitch=%ld pitchc=%ld target=%ld perr=%ld rate=%ld "
+        "DBG[%s] t=%lu en=%u valid=%u mode=%s "
+        "pitch=%ld pitchc=%ld target=%ld trim=%ld perr=%ld rate=%ld "
         "P=%ld D=%ld V=%ld X=%ld raw=%ld clamp=%ld sat=%u "
         "wv=%ld wd=%ld wp=%ld wpr=%ld "
         "u=%ld usync=%ld uturn=%ld L=%ld R=%ld "
         "fwd=%ld turn=%ld\r\n",
 
+        PROJECT_BALANCE_DEBUG_REVISION,
         (unsigned long)now_ms,
         (unsigned)g_app.control_enabled,
         (unsigned)snap.valid,
@@ -379,6 +398,7 @@ static void DebugTelemetryStep(void)
         (long)(snap.pitch_rad * 1000.0f),
         (long)(g_balance_out.pitch_corr_rad * 1000.0f),
         (long)(g_balance_out.target_pitch_rad * 1000.0f),
+        (long)(g_app.balance.state.target_trim_rad * 1000.0f),
         (long)(g_balance_out.pitch_error_rad * 1000.0f),
         (long)(snap.pitch_rate_rad_s * 1000.0f),
 
@@ -537,6 +557,115 @@ void EKF_init(void)
     }
 }
 
+
+static float apply_deadzone_slope_comp(float u_raw,
+                                       float deadzone_pos,
+                                       float deadzone_neg,
+                                       float slope_pos,
+                                       float slope_neg,
+                                       float ref_slope_abs,
+                                       float u_limit)
+{
+    float mag;
+    float slope_abs;
+    float deadzone;
+    float slope_scale;
+
+    if ((u_limit <= 0.0f) || (u_raw == 0.0f))
+    {
+        return 0.0f;
+    }
+
+    if (u_raw > 0.0f)
+    {
+        deadzone = deadzone_pos;
+        slope_abs = fabsf(slope_pos);
+    }
+    else
+    {
+        deadzone = deadzone_neg;
+        slope_abs = fabsf(slope_neg);
+    }
+
+    if (slope_abs < 1.0e-6f)
+    {
+        slope_abs = ref_slope_abs;
+    }
+
+    if (ref_slope_abs < 1.0e-6f)
+    {
+        ref_slope_abs = slope_abs;
+    }
+
+    slope_scale = ref_slope_abs / slope_abs;
+    mag = fabsf(u_raw) * slope_scale;
+
+    if (mag < 1.0e-4f)
+    {
+        return 0.0f;
+    }
+
+    mag += deadzone;
+
+    if (mag > u_limit)
+    {
+        mag = u_limit;
+    }
+
+    return (u_raw > 0.0f) ? mag : -mag;
+}
+
+static void apply_balance_output_compensation(balance_output_t *out,
+                                              const balance_calibration_persist_t *cal)
+{
+    float u_limit;
+    float left_ref;
+    float right_ref;
+    float ref_slope_abs;
+
+    if ((out == NULL) || (cal == NULL))
+    {
+        return;
+    }
+
+    if ((cal->flags & BALANCE_CALIBRATION_FLAG_VALID) == 0u)
+    {
+        return;
+    }
+
+    if (out->mode == BALANCE_MODE_CATCH)
+    {
+        return;
+    }
+
+    if (out->mode != BALANCE_MODE_BALANCE)
+    {
+        return;
+    }
+
+    u_limit = g_app.balance.params.control_u_limit;
+
+    left_ref = 0.5f * (fabsf(cal->l_slope_pos) + fabsf(cal->l_slope_neg));
+    right_ref = 0.5f * (fabsf(cal->r_slope_pos) + fabsf(cal->r_slope_neg));
+    ref_slope_abs = 0.5f * (left_ref + right_ref);
+
+    out->u_left = apply_deadzone_slope_comp(out->u_left,
+                                            cal->l_deadzone_pos,
+                                            cal->l_deadzone_neg,
+                                            cal->l_slope_pos,
+                                            cal->l_slope_neg,
+                                            ref_slope_abs,
+                                            u_limit);
+
+    out->u_right = apply_deadzone_slope_comp(out->u_right,
+                                             cal->r_deadzone_pos,
+                                             cal->r_deadzone_neg,
+                                             cal->r_slope_pos,
+                                             cal->r_slope_neg,
+                                             ref_slope_abs,
+                                             u_limit);
+}
+
 static void ControlTorqueStep(void)
 {
     balance_input_t in;
@@ -567,6 +696,8 @@ static void ControlTorqueStep(void)
         (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
         return;
     }
+
+    apply_balance_output_compensation(&g_balance_out, &g_app.calib_data);
 
     (void)odrive_pair_set_input_torque(&g_can_odrive, g_balance_out.u_left, g_balance_out.u_right);
 }
@@ -650,11 +781,28 @@ int main(void)
 
 	    can_mcp2515_odrive_process(&g_can_odrive);
 
+	    if (balance_calibration_is_active(&g_balance_cal) != 0u)
+	    {
+	        uint32_t now_ms = HAL_GetTick();
+	        if ((uint32_t)(now_ms - g_last_cal_encoder_req_ms) >= 20u)
+	        {
+	            can_mcp2515_odrive_status_t enc_st = odrive_pair_request_encoder_estimates(&g_can_odrive);
+	            if ((enc_st == CAN_MCP2515_ODRIVE_STATUS_OK) || (enc_st == CAN_MCP2515_ODRIVE_STATUS_BUSY))
+	            {
+	                g_last_cal_encoder_req_ms = now_ms;
+	            }
+	        }
+	    }
+
 	    ekf_driver_update_inputs_from_drivers(&g_ekf, &imu, &g_can_odrive);
 	    ekf_driver_process_pending(&g_ekf);
 	    ekf_driver_get_state_snapshot(&g_ekf, &snap);
 	    VerticalLedStep(&snap);
 	    app_serial_process(&g_app.serial);
+
+	    balance_calibration_process(&g_balance_cal, HAL_GetTick());
+
+
 	    DebugTelemetryStep();
 
 	    if (g_ctrl_step_pending != 0u)

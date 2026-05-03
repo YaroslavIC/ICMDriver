@@ -2,6 +2,14 @@
 #include <string.h>
 #include <math.h>
 
+#define BALANCE_TRIM_U_AVG_TAU_S                0.40f
+#define BALANCE_TRIM_ERR_AVG_TAU_S              0.60f
+#define BALANCE_TRIM_BAL_SETTLE_MS              300u
+#define BALANCE_TRIM_WHEEL_VEL_GATE_RADS        0.12f
+#define BALANCE_TRIM_ERR_MIN_RAD                0.004f
+#define BALANCE_TRIM_RATE_GATE_MIN_RADS         0.20f
+#define BALANCE_TRIM_U_WEIGHT                   0.35f
+
 static float balance_clamp(float v, float vmin, float vmax)
 {
     if (v < vmin)
@@ -73,6 +81,11 @@ balance_status_t balance_init(balance_controller_t *bal)
     bal->params.vertical_rate_thresh_mrads = BALANCE_VERTICAL_RATE_THRESH_MRADS_DEFAULT;
     bal->params.imu_pitch_zero_offset_rad = BALANCE_IMU_PITCH_ZERO_OFFSET_RAD_DEFAULT;
     bal->params.balance_target_pitch_rad = BALANCE_TARGET_PITCH_RAD_DEFAULT;
+    bal->params.target_trim_limit_rad = BALANCE_TARGET_TRIM_LIMIT_RAD_DEFAULT;
+    bal->params.target_trim_rate_rad_s = BALANCE_TARGET_TRIM_RATE_RAD_S_DEFAULT;
+    bal->params.target_trim_err_gate_rad = BALANCE_TARGET_TRIM_ERR_GATE_RAD_DEFAULT;
+    bal->params.target_trim_rate_gate_rads = BALANCE_TARGET_TRIM_RATE_GATE_RADS_DEFAULT;
+    bal->params.target_trim_u_gate = BALANCE_TARGET_TRIM_U_GATE_DEFAULT;
     bal->params.catch2bal_pitch_th_rad = BALANCE_CATCH2BAL_PITCH_TH_RAD_DEFAULT;
     bal->params.catch2bal_rate_th_rads = BALANCE_CATCH2BAL_RATE_TH_RADS_DEFAULT;
     bal->params.bal2catch_pitch_th_rad = BALANCE_BAL2CATCH_PITCH_TH_RAD_DEFAULT;
@@ -82,6 +95,7 @@ balance_status_t balance_init(balance_controller_t *bal)
     bal->params.catch_k_pitch_rate = BALANCE_CATCH_K_PITCH_RATE_DEFAULT;
     bal->params.catch_k_wheel_vel = BALANCE_CATCH_K_WHEEL_VEL_DEFAULT;
     bal->params.catch_k_wheel_pos = BALANCE_CATCH_K_WHEEL_POS_DEFAULT;
+    bal->params.catch_drive_u = BALANCE_CATCH_DRIVE_U_DEFAULT;
     bal->params.fall_pitch_pos_th_rad = BALANCE_FALL_PITCH_POS_TH_RAD_DEFAULT;
     bal->params.fall_pitch_neg_th_rad = BALANCE_FALL_PITCH_NEG_TH_RAD_DEFAULT;
     bal->params.motion_pitch_bias_per_cmd_rad = BALANCE_MOTION_PITCH_BIAS_PER_CMD_DEFAULT;
@@ -106,6 +120,9 @@ balance_status_t balance_reset(balance_controller_t *bal, float wheel_pos_ref, u
     bal->state.wheel_pos_ref = wheel_pos_ref;
     bal->state.motion_fwd_cmd_cur = 0.0f;
     bal->state.motion_turn_cmd_cur = 0.0f;
+    bal->state.target_trim_rad = 0.0f;
+    bal->state.trim_u_avg = 0.0f;
+    bal->state.trim_pitch_err_avg = 0.0f;
     bal->state.catch_in_band_active = 0u;
     return BALANCE_STATUS_OK;
 }
@@ -123,6 +140,11 @@ static void balance_set_mode(balance_controller_t *bal, balance_mode_t mode, uin
     {
         bal->state.catch_in_band_since_ms = 0u;
         bal->state.catch_in_band_active = 0u;
+    }
+    if (mode != BALANCE_MODE_BALANCE)
+    {
+        bal->state.trim_u_avg = 0.0f;
+        bal->state.trim_pitch_err_avg = 0.0f;
     }
 }
 
@@ -251,6 +273,7 @@ balance_status_t balance_step(balance_controller_t *bal,
 
     pitch_corr = in->pitch_rad + bal->params.imu_pitch_zero_offset_rad;
     target_pitch = bal->params.balance_target_pitch_rad +
+                   bal->state.target_trim_rad +
                    (bal->params.motion_pitch_bias_per_cmd_rad * bal->state.motion_fwd_cmd_cur);
     pitch_error = pitch_corr - target_pitch;
 
@@ -285,11 +308,54 @@ balance_status_t balance_step(balance_controller_t *bal,
 
     if (bal->state.mode == BALANCE_MODE_CATCH)
     {
+        float abs_pitch_error;
+        float drive_scale;
+        float drive_bias;
+        float move_toward;
+        float rate_reduce;
+
         p_term = -bal->params.catch_k_pitch * pitch_error;
         d_term = bal->params.catch_k_pitch_rate * in->pitch_rate_rad_s;
         v_term = -(bal->params.catch_k_wheel_vel * in->wheel_vel_avg);
         x_term = -(bal->params.catch_k_wheel_pos * wheel_pos_rel);
-        u_raw = p_term + d_term + v_term + x_term;
+
+        abs_pitch_error = fabsf(pitch_error);
+        drive_scale = 0.0f;
+        if (abs_pitch_error >= 0.24f)
+        {
+            drive_scale = 1.0f;
+        }
+        else if (abs_pitch_error > 0.08f)
+        {
+            drive_scale = (abs_pitch_error - 0.08f) / (0.24f - 0.08f);
+        }
+
+        move_toward = -pitch_error * in->pitch_rate_rad_s;
+        rate_reduce = 1.0f;
+        if (abs_pitch_error < 0.16f)
+        {
+            if (move_toward > 0.06f)
+            {
+                rate_reduce = 0.0f;
+            }
+            else if (move_toward > 0.00f)
+            {
+                rate_reduce = 1.0f - (move_toward / 0.06f);
+            }
+        }
+
+        drive_bias = 0.0f;
+        if ((drive_scale > 0.0f) && (rate_reduce > 0.0f))
+        {
+            drive_bias = -bal->params.catch_drive_u;
+            if (pitch_error < 0.0f)
+            {
+                drive_bias = bal->params.catch_drive_u;
+            }
+            drive_bias *= (drive_scale * rate_reduce);
+        }
+
+        u_raw = p_term + d_term + v_term + x_term + drive_bias;
         u_base = balance_clamp(u_raw,
                                -bal->params.catch_u_limit,
                                +bal->params.catch_u_limit);
@@ -310,6 +376,69 @@ balance_status_t balance_step(balance_controller_t *bal,
                                -(bal->params.control_u_limit - bal->params.control_u_sync_limit),
                                +(bal->params.control_u_limit - bal->params.control_u_sync_limit));
 
+        {
+            float trim_u_avg_alpha;
+            float trim_err_avg_alpha;
+            float trim_u_norm;
+            float trim_err_norm;
+            float trim_cmd;
+            float trim_err_gate;
+            float trim_rate_gate;
+            uint8_t trim_allow;
+
+            trim_u_avg_alpha = dt_s / (BALANCE_TRIM_U_AVG_TAU_S + dt_s);
+            trim_u_avg_alpha = balance_clamp(trim_u_avg_alpha, 0.0f, 1.0f);
+            bal->state.trim_u_avg += (u_base - bal->state.trim_u_avg) * trim_u_avg_alpha;
+
+            trim_err_avg_alpha = dt_s / (BALANCE_TRIM_ERR_AVG_TAU_S + dt_s);
+            trim_err_avg_alpha = balance_clamp(trim_err_avg_alpha, 0.0f, 1.0f);
+            bal->state.trim_pitch_err_avg +=
+                (pitch_error - bal->state.trim_pitch_err_avg) * trim_err_avg_alpha;
+
+            trim_err_gate = bal->params.target_trim_err_gate_rad;
+            if (trim_err_gate < BALANCE_TRIM_ERR_MIN_RAD)
+            {
+                trim_err_gate = BALANCE_TRIM_ERR_MIN_RAD;
+            }
+
+            trim_rate_gate = bal->params.target_trim_rate_gate_rads;
+            if (trim_rate_gate < BALANCE_TRIM_RATE_GATE_MIN_RADS)
+            {
+                trim_rate_gate = BALANCE_TRIM_RATE_GATE_MIN_RADS;
+            }
+
+            trim_allow = 0u;
+            if (((uint32_t)(in->now_ms - bal->state.mode_enter_ms) >= BALANCE_TRIM_BAL_SETTLE_MS) &&
+                (fabsf(in->pitch_rate_rad_s) < trim_rate_gate) &&
+                (fabsf(in->wheel_vel_avg) < BALANCE_TRIM_WHEEL_VEL_GATE_RADS) &&
+                (out->saturated == 0u))
+            {
+                trim_allow = 1u;
+            }
+
+            if (trim_allow != 0u)
+            {
+                trim_u_norm = 0.0f;
+                if (bal->params.control_u_limit > 1e-6f)
+                {
+                    trim_u_norm = bal->state.trim_u_avg / bal->params.control_u_limit;
+                }
+                trim_u_norm = balance_clamp(trim_u_norm, -1.0f, 1.0f);
+
+                trim_err_norm = bal->state.trim_pitch_err_avg / trim_err_gate;
+                trim_err_norm = balance_clamp(trim_err_norm, -1.0f, 1.0f);
+
+                trim_cmd = trim_err_norm - (BALANCE_TRIM_U_WEIGHT * trim_u_norm);
+                trim_cmd = balance_clamp(trim_cmd, -1.0f, 1.0f);
+
+                bal->state.target_trim_rad +=
+                    trim_cmd * bal->params.target_trim_rate_rad_s * dt_s;
+                bal->state.target_trim_rad = balance_clamp(
+                    bal->state.target_trim_rad,
+                    -bal->params.target_trim_limit_rad,
+                    +bal->params.target_trim_limit_rad);
+            }
+        }
 
         sync_term = -(bal->params.control_k_sync * in->wheel_vel_diff);
         sync_term = balance_clamp(sync_term,

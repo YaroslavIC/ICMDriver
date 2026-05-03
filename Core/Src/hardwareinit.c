@@ -124,6 +124,11 @@ app_serial_status_t hardwareinit_serial_get_param(void *ctx, app_serial_param_id
     case APP_SERIAL_PARAM_VERTICAL_RATE_THRESH_MRADS: *value = app->balance.params.vertical_rate_thresh_mrads; break;
     case APP_SERIAL_PARAM_IMU_PITCH_ZERO_OFFSET_RAD: *value = app->balance.params.imu_pitch_zero_offset_rad; break;
     case APP_SERIAL_PARAM_BALANCE_TARGET_PITCH_RAD: *value = app->balance.params.balance_target_pitch_rad; break;
+    case APP_SERIAL_PARAM_TARGET_TRIM_LIMIT_RAD: *value = app->balance.params.target_trim_limit_rad; break;
+    case APP_SERIAL_PARAM_TARGET_TRIM_RATE_RAD_S: *value = app->balance.params.target_trim_rate_rad_s; break;
+    case APP_SERIAL_PARAM_TARGET_TRIM_ERR_GATE_RAD: *value = app->balance.params.target_trim_err_gate_rad; break;
+    case APP_SERIAL_PARAM_TARGET_TRIM_RATE_GATE_RADS: *value = app->balance.params.target_trim_rate_gate_rads; break;
+    case APP_SERIAL_PARAM_TARGET_TRIM_U_GATE: *value = app->balance.params.target_trim_u_gate; break;
     case APP_SERIAL_PARAM_CATCH2BAL_PITCH_TH_RAD: *value = app->balance.params.catch2bal_pitch_th_rad; break;
     case APP_SERIAL_PARAM_CATCH2BAL_RATE_TH_RADS: *value = app->balance.params.catch2bal_rate_th_rads; break;
     case APP_SERIAL_PARAM_BAL2CATCH_PITCH_TH_RAD: *value = app->balance.params.bal2catch_pitch_th_rad; break;
@@ -133,6 +138,7 @@ app_serial_status_t hardwareinit_serial_get_param(void *ctx, app_serial_param_id
     case APP_SERIAL_PARAM_CATCH_K_PITCH_RATE: *value = app->balance.params.catch_k_pitch_rate; break;
     case APP_SERIAL_PARAM_CATCH_K_WHEEL_VEL: *value = app->balance.params.catch_k_wheel_vel; break;
     case APP_SERIAL_PARAM_CATCH_K_WHEEL_POS: *value = app->balance.params.catch_k_wheel_pos; break;
+    case APP_SERIAL_PARAM_CATCH_DRIVE_U: *value = app->balance.params.catch_drive_u; break;
     case APP_SERIAL_PARAM_FALL_PITCH_POS_TH_RAD: *value = app->balance.params.fall_pitch_pos_th_rad; break;
     case APP_SERIAL_PARAM_FALL_PITCH_NEG_TH_RAD: *value = app->balance.params.fall_pitch_neg_th_rad; break;
     case APP_SERIAL_PARAM_MOTION_PITCH_BIAS_PER_CMD_RAD: *value = app->balance.params.motion_pitch_bias_per_cmd_rad; break;
@@ -187,6 +193,26 @@ app_serial_status_t hardwareinit_serial_set_param(void *ctx, app_serial_param_id
         break;
     case APP_SERIAL_PARAM_IMU_PITCH_ZERO_OFFSET_RAD: app->balance.params.imu_pitch_zero_offset_rad = value; break;
     case APP_SERIAL_PARAM_BALANCE_TARGET_PITCH_RAD: app->balance.params.balance_target_pitch_rad = value; break;
+    case APP_SERIAL_PARAM_TARGET_TRIM_LIMIT_RAD:
+        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
+        app->balance.params.target_trim_limit_rad = value;
+        break;
+    case APP_SERIAL_PARAM_TARGET_TRIM_RATE_RAD_S:
+        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
+        app->balance.params.target_trim_rate_rad_s = value;
+        break;
+    case APP_SERIAL_PARAM_TARGET_TRIM_ERR_GATE_RAD:
+        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
+        app->balance.params.target_trim_err_gate_rad = value;
+        break;
+    case APP_SERIAL_PARAM_TARGET_TRIM_RATE_GATE_RADS:
+        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
+        app->balance.params.target_trim_rate_gate_rads = value;
+        break;
+    case APP_SERIAL_PARAM_TARGET_TRIM_U_GATE:
+        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
+        app->balance.params.target_trim_u_gate = value;
+        break;
     case APP_SERIAL_PARAM_CATCH2BAL_PITCH_TH_RAD:
         if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
         app->balance.params.catch2bal_pitch_th_rad = value;
@@ -211,6 +237,7 @@ app_serial_status_t hardwareinit_serial_set_param(void *ctx, app_serial_param_id
     case APP_SERIAL_PARAM_CATCH_K_PITCH_RATE: app->balance.params.catch_k_pitch_rate = value; break;
     case APP_SERIAL_PARAM_CATCH_K_WHEEL_VEL: app->balance.params.catch_k_wheel_vel = value; break;
     case APP_SERIAL_PARAM_CATCH_K_WHEEL_POS: app->balance.params.catch_k_wheel_pos = value; break;
+    case APP_SERIAL_PARAM_CATCH_DRIVE_U: app->balance.params.catch_drive_u = value; break;
     case APP_SERIAL_PARAM_FALL_PITCH_POS_TH_RAD: app->balance.params.fall_pitch_pos_th_rad = value; break;
     case APP_SERIAL_PARAM_FALL_PITCH_NEG_TH_RAD: app->balance.params.fall_pitch_neg_th_rad = value; break;
     case APP_SERIAL_PARAM_MOTION_PITCH_BIAS_PER_CMD_RAD: app->balance.params.motion_pitch_bias_per_cmd_rad = value; break;

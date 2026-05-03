@@ -9,11 +9,15 @@ import queue
 import re
 import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 import serial
 import serial.tools.list_ports
@@ -31,10 +35,10 @@ except Exception:
     OPENAI_AVAILABLE = False
 
 
-APP_VERSION = "v10.0.0"
+APP_VERSION = "v10.1.6"
 
 DBG_PATTERN = re.compile(
-    r"DBG\s+.*?\bt=(?P<t>-?\d+).*?"
+    r"DBG(?:\[[^\]]+\])?\s+.*?(?:\bt=(?P<t>-?\d+).*?)?"
     r"\ben=(?P<en>-?\d+).*?"
     r"\bmode=(?P<mode>[A-Za-z0-9_]+).*?"
     r"\bpitch=(?P<pitch>-?\d+).*?"
@@ -46,6 +50,48 @@ DBG_PATTERN = re.compile(
 KV_PATTERN = re.compile(
     r"(?P<key>[A-Za-z0-9_]+)\s*(?:=|:)\s*"
     r"(?P<value>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+)
+
+CALSTAT_RE = re.compile(
+    r"^CALSTAT phase=(?P<phase>\S+)(?: step=(?P<step>-?\d+))? state=(?P<state>\S+)$"
+)
+
+CALPT_RE = re.compile(
+    r"^CALPT wheel=(?P<wheel>[LR]) dir=(?P<dir>POS|NEG) phase=(?P<phase>SEARCH|CURVE) "
+    r"step=(?P<step>\d+) u=(?P<u>-?\d+(?:\.\d+)?) vel=(?P<vel>-?\d+(?:\.\d+)?) "
+    r"vel_avg=(?P<vel_avg>-?\d+(?:\.\d+)?) moved=(?P<moved>[01]) "
+    r"t_move_ms=(?P<t_move_ms>-?\d+) hold_ms=(?P<hold_ms>\d+)$"
+)
+
+CALDZ_RE = re.compile(
+    r"^CALDZ wheel=(?P<wheel>[LR]) dir=(?P<dir>POS|NEG) "
+    r"deadzone=(?P<deadzone>-?\d+(?:\.\d+)?) breakaway=(?P<breakaway>-?\d+(?:\.\d+)?) "
+    r"t_move_ms=(?P<t_move_ms>-?\d+)$"
+)
+
+CALRES1_RE = re.compile(
+    r"^CALRES1 l_deadzone_pos=(?P<l_deadzone_pos>-?\d+(?:\.\d+)?) "
+    r"l_deadzone_neg=(?P<l_deadzone_neg>-?\d+(?:\.\d+)?) "
+    r"r_deadzone_pos=(?P<r_deadzone_pos>-?\d+(?:\.\d+)?) "
+    r"r_deadzone_neg=(?P<r_deadzone_neg>-?\d+(?:\.\d+)?)$"
+)
+
+CALRES2_RE = re.compile(
+    r"^CALRES2 l_breakaway_pos=(?P<l_breakaway_pos>-?\d+(?:\.\d+)?) "
+    r"l_breakaway_neg=(?P<l_breakaway_neg>-?\d+(?:\.\d+)?) "
+    r"r_breakaway_pos=(?P<r_breakaway_pos>-?\d+(?:\.\d+)?) "
+    r"r_breakaway_neg=(?P<r_breakaway_neg>-?\d+(?:\.\d+)?)$"
+)
+
+CALRES3_RE = re.compile(
+    r"^CALRES3 l_slope_pos=(?P<l_slope_pos>-?\d+(?:\.\d+)?) "
+    r"l_slope_neg=(?P<l_slope_neg>-?\d+(?:\.\d+)?) "
+    r"r_slope_pos=(?P<r_slope_pos>-?\d+(?:\.\d+)?) "
+    r"r_slope_neg=(?P<r_slope_neg>-?\d+(?:\.\d+)?) flash=(?P<flash>\S+)$"
+)
+
+CALERR_RE = re.compile(
+    r"^CALERR code=(?P<code>\S+) reason=(?P<reason>\S+)$"
 )
 
 PARAM_NAMES = [
@@ -60,6 +106,11 @@ PARAM_NAMES = [
     "vertical_rate_thresh_mrads",
     "imu_pitch_zero_offset_rad",
     "balance_target_pitch_rad",
+    "target_trim_limit_rad",
+    "target_trim_rate_rad_s",
+    "target_trim_err_gate_rad",
+    "target_trim_rate_gate_rads",
+    "target_trim_u_gate",
     "catch2bal_pitch_th_rad",
     "catch2bal_rate_th_rads",
     "bal2catch_pitch_th_rad",
@@ -206,8 +257,20 @@ class RobotGuiApp:
 
         self.log_lines: list[str] = []
         self.telemetry: list[TelemetryPoint] = []
+        self.pitch_plot_points: list[tuple[int, int]] = []
+        self._control_plot_update_after_id = None
         self.param_vars: dict[str, tk.StringVar] = {}
         self.last_values: dict[str, float] = {}
+
+        self.calib_points: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+        self.calib_deadzone: dict[tuple[str, str], dict[str, float | int]] = {}
+        self.calib_result: dict[str, float | str | None] = {}
+        self.calib_status_var = tk.StringVar(value="Калибровка не запускалась")
+        self.calib_phase_var = tk.StringVar(value="-")
+        self.calib_step_var = tk.StringVar(value="-")
+        self.calib_flash_var = tk.StringVar(value="-")
+        self.calib_error_var = tk.StringVar(value="-")
+        self._calib_plot_update_after_id = None
 
         self.presets_dir = Path.cwd() / "robot_presets"
         self.presets_dir.mkdir(parents=True, exist_ok=True)
@@ -231,6 +294,10 @@ class RobotGuiApp:
         self.command_batch_index = 0
         self.command_batch_after_id = None
         self.command_batch_delay_ms = 120
+        self.offer_save_after_en0_rsp = False
+        self.stop_log_snapshot_lines: list[str] | None = None
+        self.awaiting_get_all_before_en1 = False
+        self.last_sent_enable = 0
         self.dbg_since_connect = 0
 
         self.attempt_active = False
@@ -244,31 +311,74 @@ class RobotGuiApp:
         self.analysis_stop_requested = False
 
         self._build_ui()
+        self.reset_calibration_view()
         self._install_clipboard_shortcuts()
+        self.en1_auto_delay_ms = 150
+        self._pending_en1_after_id = None
         self._log_startup()
         self._refresh_ports()
         self._schedule_poll()
 
     def _build_ui(self) -> None:
-        self.root.columnconfigure(0, weight=0)
-        self.root.columnconfigure(1, weight=1)
+        self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=0)
 
-        left = ttk.Frame(self.root, padding=8, width=780)
-        left.grid(row=0, column=0, sticky="nsw")
+        top = ttk.Frame(self.root, padding=8)
+        top.grid(row=0, column=0, sticky="nsew")
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(0, weight=1)
+
+        self.main_notebook = ttk.Notebook(top)
+        self.main_notebook.grid(row=0, column=0, sticky="nsew")
+
+        self.control_tab = ttk.Frame(self.main_notebook, padding=8)
+        self.ai_tab = ttk.Frame(self.main_notebook, padding=8)
+        self.calibration_tab = ttk.Frame(self.main_notebook, padding=8)
+
+        self.main_notebook.add(self.control_tab, text="Управление")
+        self.main_notebook.add(self.ai_tab, text="AI")
+        self.main_notebook.add(self.calibration_tab, text="Calibration")
+
+        self._build_control_tab(self.control_tab)
+        self._build_ai_tab(self.ai_tab)
+        self._build_calibration_tab(self.calibration_tab)
+
+        log_host = ttk.Frame(self.root, padding=(8, 0, 8, 8))
+        log_host.grid(row=1, column=0, sticky="nsew")
+        log_host.columnconfigure(0, weight=1)
+        log_host.rowconfigure(0, weight=1)
+        self._build_common_log(log_host)
+
+    def _build_control_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=0)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(parent, width=820)
+        left.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
         left.grid_propagate(False)
         left.columnconfigure(0, weight=1)
 
-        right = ttk.Frame(self.root, padding=8)
+        right = ttk.Frame(parent)
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=3)
-        right.rowconfigure(1, weight=2)
+        right.rowconfigure(0, weight=1)
 
-        self._build_left(left)
-        self._build_right(right)
+        self._build_control_left(left)
 
-    def _build_left(self, left: ttk.Frame) -> None:
+        info = ttk.LabelFrame(right, text="Обзор", padding=10)
+        info.grid(row=0, column=0, sticky="nsew")
+        info.columnconfigure(0, weight=1)
+        info.rowconfigure(0, weight=1)
+
+        self.control_pitch_fig = Figure(figsize=(9, 4.8), dpi=100)
+        self.control_pitch_ax = self.control_pitch_fig.add_subplot(111)
+        self.control_pitch_canvas = FigureCanvasTkAgg(self.control_pitch_fig, master=info)
+        self.control_pitch_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self._refresh_control_pitch_plot(force=True)
+
+    def _build_control_left(self, left: ttk.Frame) -> None:
         conn = ttk.LabelFrame(left, text="Подключение", padding=8)
         conn.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         conn.columnconfigure(1, weight=1)
@@ -291,13 +401,14 @@ class RobotGuiApp:
         self.status_var = tk.StringVar(value="Не подключено")
         ttk.Label(conn, textvariable=self.status_var).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-        self.auto_reconnect_var = tk.BooleanVar(value=True)
+        self.auto_reconnect_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(conn, text="Автопереподключение (5 попыток)", variable=self.auto_reconnect_var).grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(6, 0)
         )
 
         cmd = ttk.LabelFrame(left, text="Команды", padding=8)
-        cmd.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        cmd.grid(row=1, column=0, sticky="nsew")
+        left.rowconfigure(1, weight=1)
         cmd.columnconfigure(0, weight=1)
         cmd.rowconfigure(1, weight=1)
 
@@ -311,9 +422,11 @@ class RobotGuiApp:
         ttk.Button(cmd_top, text="Отправить пачкой", command=self.send_raw_command).grid(row=0, column=2, padx=(12, 0))
         ttk.Button(cmd_top, text="Очистить", command=self.clear_command_box).grid(row=0, column=3, padx=(6, 0))
 
-        self.cmd_text = tk.Text(cmd, height=6, wrap="word")
-        self.cmd_text.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.cmd_text = tk.Text(cmd, height=10, wrap="word")
+        self.cmd_text.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         self.cmd_text.bind("<Control-Return>", lambda _e: self.send_raw_command())
+        self.cmd_text.bind("<Control-v>", self._paste_to_focused_widget)
+        self.cmd_text.bind("<Control-V>", self._paste_to_focused_widget)
 
         cmd_scroll = ttk.Scrollbar(cmd, orient="vertical", command=self.cmd_text.yview)
         cmd_scroll.grid(row=1, column=2, sticky="ns", pady=(8, 0))
@@ -326,16 +439,78 @@ class RobotGuiApp:
         ttk.Button(quick, text="en 1", command=lambda: self.send_command("en 1")).pack(side="left", padx=(0, 4))
         ttk.Button(quick, text="en 0", command=lambda: self.send_command("en 0")).pack(side="left")
 
-        presets = ttk.LabelFrame(left, text="Пресеты", padding=8)
-        presets.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        ttk.Button(presets, text="Сохранить пресет", command=self.save_preset_auto).pack(side="left", padx=(0, 4))
-        ttk.Button(presets, text="Загрузить пресет", command=self.load_preset_from_list).pack(side="left", padx=(0, 4))
-        ttk.Button(presets, text="Открыть папку", command=self.show_presets_folder).pack(side="left")
-        self.preset_status_var = tk.StringVar(value=f"Папка пресетов: {self.presets_dir}")
-        ttk.Label(presets, textvariable=self.preset_status_var).pack(side="left", padx=(10, 0))
+
+    def _append_pitch_plot_point(self, point: TelemetryPoint) -> None:
+        self.pitch_plot_points.append((point.t_ms, point.pitch_mrad))
+        latest_t = point.t_ms
+        min_t = latest_t - 30000
+        self.pitch_plot_points = [(t_ms, pitch) for t_ms, pitch in self.pitch_plot_points if t_ms >= min_t]
+        self._schedule_control_plot_update()
+
+    def _schedule_control_plot_update(self) -> None:
+        if not hasattr(self, "root"):
+            return
+        if self._control_plot_update_after_id is not None:
+            return
+        self._control_plot_update_after_id = self.root.after(150, self._refresh_control_pitch_plot)
+
+    def _refresh_control_pitch_plot(self, force: bool = False) -> None:
+        if not hasattr(self, "control_pitch_ax"):
+            self._control_plot_update_after_id = None
+            return
+        self._control_plot_update_after_id = None
+
+        ax = self.control_pitch_ax
+        ax.clear()
+        ax.set_title("Pitch за последние 30 секунд")
+        ax.set_xlabel("Время, с")
+        ax.set_ylabel("pitch, mrad")
+        ax.grid(True)
+
+        points = self.pitch_plot_points[-2000:]
+        if points:
+            latest_t = points[-1][0]
+            min_t = latest_t - 30000
+            points = [(t_ms, pitch) for t_ms, pitch in points if t_ms >= min_t]
+            if points:
+                xs = [-(latest_t - t_ms) / 1000.0 for t_ms, _pitch in points]
+                ys = [pitch for _t_ms, pitch in points]
+                ax.plot(xs, ys, linewidth=1.5)
+                ax.set_xlim(-30.0, 0.0)
+                ymin = min(ys)
+                ymax = max(ys)
+                if ymin == ymax:
+                    pad = 10.0
+                else:
+                    pad = max(10.0, (ymax - ymin) * 0.1)
+                ax.set_ylim(ymin - pad, ymax + pad)
+            else:
+                ax.set_xlim(-30.0, 0.0)
+        else:
+            ax.set_xlim(-30.0, 0.0)
+            ax.set_ylim(-1000.0, 1000.0)
+
+        ax.set_xticks([-30, -25, -20, -15, -10, -5, 0])
+        ax.figure.tight_layout()
+        self.control_pitch_canvas.draw_idle()
+
+    def _build_ai_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=0)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(parent, width=760)
+        left.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        left.grid_propagate(False)
+        left.columnconfigure(0, weight=1)
+
+        right = ttk.Frame(parent)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
 
         ai = ttk.LabelFrame(left, text="AI analysis", padding=8)
-        ai.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        ai.grid(row=0, column=0, sticky="new")
         ai.columnconfigure(1, weight=1)
 
         ttk.Label(ai, text="API key:").grid(row=0, column=0, sticky="w")
@@ -378,20 +553,137 @@ class RobotGuiApp:
         ttk.Button(ai_btns, text="Test network (raw)", command=self.start_network_test).pack(side="left", padx=(0, 4))
         ttk.Button(ai_btns, text="Вставить ключ из ENV", command=self.fill_api_key_from_env).pack(side="left")
 
-        params = ttk.LabelFrame(left, text="Параметры", padding=8)
-        params.grid(row=4, column=0, sticky="nsew")
-        left.rowconfigure(4, weight=1)
+        ai_frame = ttk.LabelFrame(right, text="AI result", padding=8)
+        ai_frame.grid(row=0, column=0, sticky="nsew")
+        ai_frame.columnconfigure(0, weight=1)
+        ai_frame.rowconfigure(0, weight=1)
 
-        self.param_inner = ttk.Frame(params)
-        self.param_inner.pack(fill="both", expand=True)
-        self._build_param_rows()
+        self.ai_text = tk.Text(ai_frame, wrap="word", height=16)
+        self.ai_text.grid(row=0, column=0, sticky="nsew")
+        ai_y = ttk.Scrollbar(ai_frame, orient="vertical", command=self.ai_text.yview)
+        ai_y.grid(row=0, column=1, sticky="ns")
+        self.ai_text.configure(yscrollcommand=ai_y.set)
 
-        param_buttons = ttk.Frame(left)
-        param_buttons.grid(row=5, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(param_buttons, text="Обновить все из МК", command=lambda: self.send_command("get all")).pack(side="left", padx=(0, 4))
-        ttk.Button(param_buttons, text="Применить current.json", command=self.apply_current_json_button).pack(side="left", padx=(0, 4))
-        ttk.Button(param_buttons, text="Подтянуть в поля", command=self.fill_params_from_last_values).pack(side="left")
+        ai_bottom = ttk.Frame(ai_frame)
+        ai_bottom.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(ai_bottom, text="Скопировать AI", command=self.copy_ai_text).pack(side="left")
 
+    def _build_calibration_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=0)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(parent, width=460)
+        left.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        left.grid_propagate(False)
+        left.columnconfigure(0, weight=1)
+
+        right = ttk.Frame(parent)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+
+        ctl = ttk.LabelFrame(left, text="Полная калибровка", padding=8)
+        ctl.grid(row=0, column=0, sticky="new", pady=(0, 8))
+        ctl.columnconfigure(1, weight=1)
+
+        ttk.Button(ctl, text="Калибровка", command=self.start_calibration).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(ctl, text="Abort", command=self.abort_calibration).grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        ttk.Button(ctl, text="Read flash", command=self.read_flash_calibration).grid(row=0, column=2, sticky="ew")
+
+        ttk.Label(ctl, text="Статус:").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(ctl, textvariable=self.calib_status_var).grid(row=1, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(ctl, text="Фаза:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(ctl, textvariable=self.calib_phase_var).grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(ctl, text="Шаг:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(ctl, textvariable=self.calib_step_var).grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(ctl, text="Flash:").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(ctl, textvariable=self.calib_flash_var).grid(row=4, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(ctl, text="Ошибка:").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(ctl, textvariable=self.calib_error_var).grid(row=5, column=1, columnspan=2, sticky="w", pady=(6, 0))
+
+        summary = ttk.LabelFrame(left, text="Итоговые коэффициенты", padding=8)
+        summary.grid(row=1, column=0, sticky="nsew")
+        left.rowconfigure(1, weight=1)
+        summary.columnconfigure(0, weight=1)
+        summary.rowconfigure(0, weight=1)
+
+        self.calib_tree = ttk.Treeview(summary, columns=("metric", "value"), show="headings", height=14)
+        self.calib_tree.heading("metric", text="Параметр")
+        self.calib_tree.heading("value", text="Значение")
+        self.calib_tree.column("metric", width=220, anchor="w")
+        self.calib_tree.column("value", width=120, anchor="center")
+        self.calib_tree.grid(row=0, column=0, sticky="nsew")
+        calib_scroll = ttk.Scrollbar(summary, orient="vertical", command=self.calib_tree.yview)
+        calib_scroll.grid(row=0, column=1, sticky="ns")
+        self.calib_tree.configure(yscrollcommand=calib_scroll.set)
+
+        plots = ttk.LabelFrame(right, text="Графики calibration", padding=8)
+        plots.grid(row=0, column=0, sticky="nsew")
+        plots.columnconfigure(0, weight=1)
+        plots.rowconfigure(0, weight=1)
+
+        self.calib_plot_tabs = ttk.Notebook(plots)
+        self.calib_plot_tabs.grid(row=0, column=0, sticky="nsew")
+
+        self.calib_deadzone_frame = ttk.Frame(self.calib_plot_tabs)
+        self.calib_curve_frame = ttk.Frame(self.calib_plot_tabs)
+        self.calib_tmove_frame = ttk.Frame(self.calib_plot_tabs)
+        self.calib_plot_tabs.add(self.calib_deadzone_frame, text="Поиск deadzone")
+        self.calib_plot_tabs.add(self.calib_curve_frame, text="Moment -> speed")
+        self.calib_plot_tabs.add(self.calib_tmove_frame, text="Time to move")
+
+        self.deadzone_fig = Figure(figsize=(8, 4), dpi=100)
+        self.deadzone_ax = self.deadzone_fig.add_subplot(111)
+        self.deadzone_canvas = FigureCanvasTkAgg(self.deadzone_fig, master=self.calib_deadzone_frame)
+        self.deadzone_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        self.curve_fig = Figure(figsize=(8, 4), dpi=100)
+        self.curve_ax = self.curve_fig.add_subplot(111)
+        self.curve_canvas = FigureCanvasTkAgg(self.curve_fig, master=self.calib_curve_frame)
+        self.curve_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        self.tmove_fig = Figure(figsize=(8, 4), dpi=100)
+        self.tmove_ax = self.tmove_fig.add_subplot(111)
+        self.tmove_canvas = FigureCanvasTkAgg(self.tmove_fig, master=self.calib_tmove_frame)
+        self.tmove_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        note = ttk.LabelFrame(right, text="Описание", padding=8)
+        note.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        note.columnconfigure(0, weight=1)
+        note.rowconfigure(0, weight=1)
+        text = tk.Text(note, wrap="word", height=7)
+        text.grid(row=0, column=0, sticky="nsew")
+        text.insert(
+            "1.0",
+            "Кнопка 'Калибровка' запускает полный автоматический цикл на STM32.\n"
+            "Ожидаемые строки от МК: CALSTAT, CALPT, CALDZ, CALRES1/2/3, CALERR.\n"
+            "После завершения МК сам сохраняет коэффициенты во flash, GUI только отображает ход и итог.\n"
+            "График 'Поиск deadzone' строится по SEARCH-точкам, 'Moment -> speed' по CURVE-точкам.\n"
+        )
+        text.configure(state="disabled")
+
+    def _build_common_log(self, parent: ttk.Frame) -> None:
+        log_frame = ttk.LabelFrame(parent, text="Лог / ответы МК", padding=8)
+        log_frame.grid(row=0, column=0, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+
+        self.log_text = tk.Text(log_frame, wrap="none", height=12)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self.log_text.bind("<Control-c>", self._on_log_copy)
+        self.log_text.bind("<Button-3>", self._show_log_context_menu)
+
+        log_y = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        log_y.grid(row=0, column=1, sticky="ns")
+        log_x = ttk.Scrollbar(log_frame, orient="horizontal", command=self.log_text.xview)
+        log_x.grid(row=1, column=0, sticky="ew")
+        self.log_text.configure(yscrollcommand=log_y.set, xscrollcommand=log_x.set)
+
+        log_btns = ttk.Frame(log_frame)
+        log_btns.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(log_btns, text="Очистить лог", command=self.clear_log).pack(side="left", padx=(0, 4))
+        ttk.Button(log_btns, text="Сохранить лог", command=self.save_log).pack(side="left")
 
     def _install_clipboard_shortcuts(self) -> None:
         for class_name in ("Entry", "TEntry", "Text", "TCombobox"):
@@ -583,6 +875,34 @@ class RobotGuiApp:
             self.worker = None
         self.status_var.set("Отключено")
 
+    def _prepare_attempt_capture(self) -> None:
+        self.attempt_lines.clear()
+        self.telemetry.clear()
+        self.attempt_active = True
+        self.attempt_started_on_dbg = False
+        self.awaiting_final_en0_for_attempt = False
+        self.attempt_tail_collecting = False
+        self.attempt_tail_deadline_monotonic = 0.0
+        self.analysis_stop_requested = False
+        self._update_attempt_state()
+        self._append_ai("[AI] Начата новая попытка: ожидание первой DBG строки с en=1")
+
+    def _send_command_immediate(self, command: str) -> None:
+        try:
+            self.worker.write_line(command)
+            self._append_log(f">>> {command}")
+        except Exception as exc:
+            self._append_log(f"TX ERROR: {type(exc).__name__}: {exc}")
+
+    def _auto_send_en1_after_get_all(self) -> None:
+        self._pending_en1_after_id = None
+        if self.worker is None:
+            self._append_log("[AUTO] en 1 отменён: нет подключения")
+            return
+        self.awaiting_get_all_before_en1 = False
+        self._prepare_attempt_capture()
+        self._send_command_immediate("en 1")
+
     def send_command(self, command: str) -> None:
         command = command.strip()
         if not command:
@@ -593,30 +913,34 @@ class RobotGuiApp:
 
         lowered = command.lower()
         if lowered == "en 1":
-            self.attempt_lines.clear()
-            self.telemetry.clear()
-            self.attempt_active = True
-            self.attempt_started_on_dbg = False
-            self.awaiting_final_en0_for_attempt = False
-            self.attempt_tail_collecting = False
-            self.attempt_tail_deadline_monotonic = 0.0
-            self.analysis_stop_requested = False
-            self._update_attempt_state()
-            self._append_ai("[AI] Начата новая попытка: ожидание первой DBG строки с en=1")
-        elif lowered == "en 0":
+            if self._pending_en1_after_id is not None:
+                try:
+                    self.root.after_cancel(self._pending_en1_after_id)
+                except Exception:
+                    pass
+                self._pending_en1_after_id = None
+            self.awaiting_get_all_before_en1 = True
+            self.clear_log()
+            self._append_log("[AUTO] clear log before en 1")
+            self._append_log("[AUTO] inject get all before en 1")
+            self._send_command_immediate("get all")
+            return
+
+        if lowered == "en 0":
             if self.ai_busy:
                 self.analysis_stop_requested = True
                 self.awaiting_final_en0_for_attempt = True
                 self._append_ai("[AI] Ожидание первой завершающей DBG строки с en=0")
             else:
                 self.attempt_active = False
+            if self.last_sent_enable == 1 or self.attempt_started_on_dbg or len(self.attempt_lines) > 0:
+                self.offer_save_after_en0_rsp = True
             self._update_attempt_state()
 
-        try:
-            self.worker.write_line(command)
-            self._append_log(f">>> {command}")
-        except Exception as exc:
-            self._append_log(f"TX ERROR: {type(exc).__name__}: {exc}")
+        self._send_command_immediate(command)
+
+        if lowered == "en 0":
+            self.stop_log_snapshot_lines = list(self.log_lines)
 
     def send_raw_command(self) -> None:
         text = self.cmd_text.get("1.0", "end-1c")
@@ -1127,12 +1451,25 @@ class RobotGuiApp:
             return
 
         self._append_log(line)
+        self._handle_calibration_line(line)
+
+        if line.strip() == "RSP en=1":
+            self.last_sent_enable = 1
+        elif line.strip() == "RSP en=0":
+            self.last_sent_enable = 0
+            if self.awaiting_get_all_before_en1:
+                self.awaiting_get_all_before_en1 = False
+                self._pending_en1_after_id = self.root.after(self.en1_auto_delay_ms, self._auto_send_en1_after_get_all)
+            elif self.offer_save_after_en0_rsp:
+                self.offer_save_after_en0_rsp = False
+                self.root.after(0, self._offer_save_log_after_stop)
 
         dbg_match = DBG_PATTERN.search(line)
         if dbg_match:
             self.dbg_since_connect = getattr(self, "dbg_since_connect", 0) + 1
+            t_group = dbg_match.group("t")
             point = TelemetryPoint(
-                t_ms=int(dbg_match.group("t")),
+                t_ms=int(t_group) if t_group is not None else self.dbg_since_connect,
                 en=int(dbg_match.group("en")),
                 mode=str(dbg_match.group("mode")),
                 pitch_mrad=int(dbg_match.group("pitch")),
@@ -1140,6 +1477,8 @@ class RobotGuiApp:
                 wheel_vel=int(dbg_match.group("wv")),
                 u=int(dbg_match.group("u")),
             )
+
+            self._append_pitch_plot_point(point)
 
             if point.en == 0:
                 self.last_dbg_en0_line = line
@@ -1175,6 +1514,202 @@ class RobotGuiApp:
                 continue
             self.last_values[key] = value_float
             self._update_param_field_from_value(key, value_float)
+
+    def reset_calibration_view(self) -> None:
+        self.calib_points = defaultdict(list)
+        self.calib_deadzone = {}
+        self.calib_result = {
+            "l_deadzone_pos": None,
+            "l_deadzone_neg": None,
+            "r_deadzone_pos": None,
+            "r_deadzone_neg": None,
+            "l_breakaway_pos": None,
+            "l_breakaway_neg": None,
+            "r_breakaway_pos": None,
+            "r_breakaway_neg": None,
+            "l_slope_pos": None,
+            "l_slope_neg": None,
+            "r_slope_pos": None,
+            "r_slope_neg": None,
+            "flash": None,
+        }
+        self.calib_status_var.set("Калибровка не запускалась")
+        self.calib_phase_var.set("-")
+        self.calib_step_var.set("-")
+        self.calib_flash_var.set("-")
+        self.calib_error_var.set("-")
+        if hasattr(self, "calib_tree"):
+            for item in self.calib_tree.get_children():
+                self.calib_tree.delete(item)
+        self._schedule_calibration_plot_update()
+
+    def start_calibration(self) -> None:
+        self.reset_calibration_view()
+        self.calib_status_var.set("Запуск полной автоматической calibration")
+        self.send_command("CALIB_START")
+
+    def abort_calibration(self) -> None:
+        self.calib_status_var.set("Запрошена остановка calibration")
+        self.send_command("CALIB_ABORT")
+
+    def read_flash_calibration(self) -> None:
+        self.calib_status_var.set("Чтение calibration из flash")
+        self.send_command("CALIB_GET")
+
+    def _format_calib_value(self, value) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, (int, float)):
+            return f"{float(value):.4f}"
+        return str(value)
+
+    def _update_calibration_tree(self) -> None:
+        if not hasattr(self, "calib_tree"):
+            return
+        for item in self.calib_tree.get_children():
+            self.calib_tree.delete(item)
+        ordered = [
+            "l_deadzone_pos", "l_deadzone_neg", "r_deadzone_pos", "r_deadzone_neg",
+            "l_breakaway_pos", "l_breakaway_neg", "r_breakaway_pos", "r_breakaway_neg",
+            "l_slope_pos", "l_slope_neg", "r_slope_pos", "r_slope_neg", "flash",
+        ]
+        for key in ordered:
+            self.calib_tree.insert("", "end", values=(key, self._format_calib_value(self.calib_result.get(key))))
+
+    def _schedule_calibration_plot_update(self) -> None:
+        if self._calib_plot_update_after_id is not None:
+            return
+        self._calib_plot_update_after_id = self.root.after(150, self._refresh_calibration_plots)
+
+    def _refresh_calibration_plots(self) -> None:
+        self._calib_plot_update_after_id = None
+        if not hasattr(self, "deadzone_ax"):
+            return
+
+        series_order = [("L", "POS"), ("L", "NEG"), ("R", "POS"), ("R", "NEG")]
+
+        self.deadzone_ax.clear()
+        self.deadzone_ax.set_title("Поиск deadzone")
+        self.deadzone_ax.set_xlabel("Torque command")
+        self.deadzone_ax.set_ylabel("Average wheel velocity")
+        for wheel, direction in series_order:
+            pts = self.calib_points.get((wheel, direction, "SEARCH"), [])
+            if not pts:
+                continue
+            xs = [p["u"] for p in pts]
+            ys = [p["vel_avg"] for p in pts]
+            label = f"{wheel} {direction}"
+            self.deadzone_ax.plot(xs, ys, marker="o", label=label)
+            moved_pts = [p for p in pts if p.get("moved") == 1]
+            if moved_pts:
+                first = moved_pts[0]
+                self.deadzone_ax.scatter([first["u"]], [first["vel_avg"]], marker="x", s=60)
+            dz = self.calib_deadzone.get((wheel, direction), {})
+            if "deadzone" in dz:
+                self.deadzone_ax.axvline(float(dz["deadzone"]), linestyle="--", alpha=0.7)
+            if "breakaway" in dz:
+                self.deadzone_ax.axvline(float(dz["breakaway"]), linestyle=":", alpha=0.7)
+        if self.deadzone_ax.lines:
+            self.deadzone_ax.legend(loc="best")
+        self.deadzone_ax.grid(True)
+        self.deadzone_fig.tight_layout()
+        self.deadzone_canvas.draw_idle()
+
+        self.curve_ax.clear()
+        self.curve_ax.set_title("Moment -> speed")
+        self.curve_ax.set_xlabel("Torque command")
+        self.curve_ax.set_ylabel("Average wheel velocity")
+        for wheel, direction in series_order:
+            pts = self.calib_points.get((wheel, direction, "CURVE"), [])
+            if not pts:
+                continue
+            xs = [p["u"] for p in pts]
+            ys = [p["vel_avg"] for p in pts]
+            self.curve_ax.plot(xs, ys, marker="o", label=f"{wheel} {direction}")
+        if self.curve_ax.lines:
+            self.curve_ax.legend(loc="best")
+        self.curve_ax.grid(True)
+        self.curve_fig.tight_layout()
+        self.curve_canvas.draw_idle()
+
+        self.tmove_ax.clear()
+        self.tmove_ax.set_title("Time to move")
+        self.tmove_ax.set_xlabel("Torque command")
+        self.tmove_ax.set_ylabel("t_move_ms")
+        plotted = False
+        for wheel, direction in series_order:
+            pts = [p for p in self.calib_points.get((wheel, direction, "SEARCH"), []) if p.get("moved") == 1 and p.get("t_move_ms", -1) >= 0]
+            if not pts:
+                continue
+            plotted = True
+            xs = [p["u"] for p in pts]
+            ys = [p["t_move_ms"] for p in pts]
+            self.tmove_ax.plot(xs, ys, marker="o", label=f"{wheel} {direction}")
+        if plotted:
+            self.tmove_ax.legend(loc="best")
+        self.tmove_ax.grid(True)
+        self.tmove_fig.tight_layout()
+        self.tmove_canvas.draw_idle()
+
+    def _handle_calibration_line(self, line: str) -> bool:
+        match = CALSTAT_RE.match(line)
+        if match:
+            phase = match.group("phase")
+            step = match.group("step") or "-"
+            state = match.group("state")
+            self.calib_phase_var.set(phase)
+            self.calib_step_var.set(step)
+            self.calib_status_var.set(f"{state}: {phase}")
+            if state in {"OK", "FAIL", "ABORTED"}:
+                self.calib_error_var.set("-" if state == "OK" else state)
+            return True
+
+        match = CALPT_RE.match(line)
+        if match:
+            data = {
+                "step": int(match.group("step")),
+                "u": float(match.group("u")),
+                "vel": float(match.group("vel")),
+                "vel_avg": float(match.group("vel_avg")),
+                "moved": int(match.group("moved")),
+                "t_move_ms": int(match.group("t_move_ms")),
+                "hold_ms": int(match.group("hold_ms")),
+            }
+            key = (match.group("wheel"), match.group("dir"), match.group("phase"))
+            self.calib_points[key].append(data)
+            self._schedule_calibration_plot_update()
+            return True
+
+        match = CALDZ_RE.match(line)
+        if match:
+            key = (match.group("wheel"), match.group("dir"))
+            self.calib_deadzone[key] = {
+                "deadzone": float(match.group("deadzone")),
+                "breakaway": float(match.group("breakaway")),
+                "t_move_ms": int(match.group("t_move_ms")),
+            }
+            self._schedule_calibration_plot_update()
+            return True
+
+        for regex in (CALRES1_RE, CALRES2_RE, CALRES3_RE):
+            match = regex.match(line)
+            if match:
+                for key, value in match.groupdict().items():
+                    if key == "flash":
+                        self.calib_result[key] = value
+                        self.calib_flash_var.set(str(value))
+                    else:
+                        self.calib_result[key] = float(value)
+                self._update_calibration_tree()
+                return True
+
+        match = CALERR_RE.match(line)
+        if match:
+            self.calib_error_var.set(f"{match.group('code')}: {match.group('reason')}")
+            self.calib_status_var.set("Ошибка calibration")
+            return True
+
+        return False
 
     def _handle_status(self, line: str) -> None:
         if line.startswith("__STATUS__:CONNECTED:"):
@@ -1236,8 +1771,7 @@ class RobotGuiApp:
             self._schedule_auto_reconnect()
 
     def _append_log(self, line: str) -> None:
-        timestamp = time.strftime("%H:%M:%S")
-        full = f"[{timestamp}] {line}"
+        full = line
         self.log_lines.append(full)
         self.log_text.insert("end", full + "\n")
         self.log_text.see("end")
@@ -1276,14 +1810,29 @@ class RobotGuiApp:
 
     def clear_log(self) -> None:
         self.log_lines.clear()
+        self.pitch_plot_points.clear()
         self.log_text.delete("1.0", "end")
         self._log_startup()
+        self._refresh_control_pitch_plot(force=True)
 
-    def save_log(self) -> None:
+    def _offer_save_log_after_stop(self) -> None:
+        try:
+            lines_to_save = self.stop_log_snapshot_lines if self.stop_log_snapshot_lines is not None else self.log_lines
+            has_content = any(line.strip() and not line.startswith("[APP]") for line in lines_to_save)
+            if not has_content:
+                return
+            answer = messagebox.askyesno("Сохранить лог", "Попытка остановлена. Сохранить лог, зафиксированный в момент нажатия en=0?")
+            if answer:
+                self.save_log(lines_override=lines_to_save)
+        except Exception as exc:
+            self._append_log(f"[GUI] save offer error: {type(exc).__name__}: {exc}")
+
+    def save_log(self, lines_override: list[str] | None = None) -> None:
         path = filedialog.asksaveasfilename(title="Сохранить лог", defaultextension=".txt", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
         if not path:
             return
-        Path(path).write_text("\n".join(self.log_lines), encoding="utf-8")
+        lines_to_save = self.log_lines if lines_override is None else lines_override
+        Path(path).write_text("\n".join(lines_to_save), encoding="utf-8")
         messagebox.showinfo("Готово", "Лог сохранён")
 
     def _update_param_field_from_value(self, name: str, value: float) -> None:

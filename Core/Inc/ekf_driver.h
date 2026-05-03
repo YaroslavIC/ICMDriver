@@ -22,6 +22,8 @@
 extern "C" {
 #endif
 
+#define EKF_DRIVER_MODULE_VERSION        "E02"
+
 #define EKF_DRIVER_VERSION_MAJOR        (0u)
 #define EKF_DRIVER_VERSION_MINOR        (1u)
 #define EKF_DRIVER_VERSION_PATCH        (1u)
@@ -208,6 +210,13 @@ typedef struct
     float wheel_vel_avg;
     float wheel_pos_diff;
     float wheel_vel_diff;
+    // Сырые данные ODrive без EKF-усреднения.
+    float wheel_pos_left_raw;
+    float wheel_vel_left_raw;
+    float wheel_pos_right_raw;
+    float wheel_vel_right_raw;
+    uint64_t wheel_left_raw_ts_us;
+    uint64_t wheel_right_raw_ts_us;
     uint32_t step_count;
     uint8_t valid;
 } ekf_state_snapshot_t;
