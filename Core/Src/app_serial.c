@@ -6,6 +6,27 @@
 
 static app_serial_t *g_app_serial_target = NULL;
 
+__weak app_serial_status_t app_serial_output_bytes(const uint8_t *data, uint16_t len)
+{
+    uint8_t tx_status;
+
+    if ((data == NULL) || (len == 0u))
+    {
+        return APP_SERIAL_STATUS_BAD_ARG;
+    }
+
+    tx_status = CDC_Transmit_FS((uint8_t *)data, len);
+    if (tx_status == USBD_OK)
+    {
+        return APP_SERIAL_STATUS_OK;
+    }
+    if (tx_status == USBD_BUSY)
+    {
+        return APP_SERIAL_STATUS_BUSY;
+    }
+    return APP_SERIAL_STATUS_ERROR;
+}
+
 static const char *app_serial_param_name(app_serial_param_id_t id)
 {
     static const char * const names[APP_SERIAL_PARAM_COUNT] =
@@ -31,7 +52,6 @@ static const char *app_serial_param_name(app_serial_param_id_t id)
 static app_serial_status_t app_serial_try_send(app_serial_t *serial, const char *text)
 {
     uint16_t len;
-    uint8_t tx_status;
 
     if ((serial == NULL) || (text == NULL))
     {
@@ -39,16 +59,7 @@ static app_serial_status_t app_serial_try_send(app_serial_t *serial, const char 
     }
 
     len = (uint16_t)strlen(text);
-    tx_status = CDC_Transmit_FS((uint8_t *)text, len);
-    if (tx_status == USBD_OK)
-    {
-        return APP_SERIAL_STATUS_OK;
-    }
-    if (tx_status == USBD_BUSY)
-    {
-        return APP_SERIAL_STATUS_BUSY;
-    }
-    return APP_SERIAL_STATUS_ERROR;
+    return app_serial_output_bytes((const uint8_t *)text, len);
 }
 
 static app_serial_status_t app_serial_call_custom(app_serial_t *serial, const char *line, uint8_t *handled)
@@ -170,7 +181,7 @@ static app_serial_status_t app_serial_handle_line(app_serial_t *serial)
     if (strcmp(cmd, "help") == 0)
     {
         n = snprintf(serial->tx_line, sizeof(serial->tx_line),
-                     "RSP help: get all|en|<name>|imu|odrive | set <name> <value> | en <0|1> | drive <forward> <turn> | stop\r\n");
+                     "RSP help: get all|en|<name>|imu|odrive|uart | set <name> <value> | en <0|1> | drive <forward> <turn> [boost_vel] [boost_ms] | stop\r\n");
         if ((n <= 0) || (n >= (int)sizeof(serial->tx_line)))
         {
             return APP_SERIAL_STATUS_ERROR;

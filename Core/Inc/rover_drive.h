@@ -7,18 +7,20 @@ extern "C" {
 
 #include <stdint.h>
 
-#define ROVER_DRIVE_MODULE_VERSION       "R02"
+#define ROVER_DRIVE_MODULE_VERSION       "R05"
 #define ROVER_DRIVE_CMD_LIMIT            (1.0f)
 #define ROVER_DRIVE_DEFAULT_BOOST_VEL_REV_S  (0.50f)
 #define ROVER_DRIVE_DEFAULT_BOOST_MS         (250.0f)
 #define ROVER_DRIVE_MAX_BOOST_VEL_REV_S      (5.0f)
 #define ROVER_DRIVE_MAX_BOOST_MS             (3000.0f)
 
-// Версия: R02 03.05.26
+// Версия: R05 03.05.26 10:35:00
 // Назначение:
 // Дифференциальное управление rover с двумя задними ведущими колесами.
 // node_id_1 = левое заднее колесо, node_id_2 = правое заднее колесо.
 // Модуль содержит только rover-drive управление задней осью.
+// В R04 при fault/timeout/en=0 выходы сбрасываются сразу, без ramp-спада.
+// В R05 timeout учитывается только для активной drive-команды, чтобы en=1 без движения не уходил в timeout.
 
 typedef enum
 {

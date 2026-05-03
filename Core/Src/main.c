@@ -43,16 +43,36 @@
 #define ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL   8U
 #define ODRV_CONTROL_MODE_VELOCITY_CONTROL    2U
 #define ODRV_INPUT_MODE_PASSTHROUGH           1U
-#define APP_ODRIVE_STATE_CMD_PERIOD_MS        250U
+#define APP_ODRIVE_STATE_CMD_PERIOD_MS        100U
+#define APP_ODRIVE_CLOSED_LOOP_SETTLE_MS      250U
+#define APP_ODRIVE_ENABLE_REINIT_STEP_MS      120U
+#define APP_ODRIVE_ENABLE_REINIT_SETTLE_MS    350U
 #define APP_ROVER_DRIVE_CMD_ACTIVE_EPS       (0.001f)
 #define APP_ODRIVE_LEFT_VEL_GAIN             (0.05f)
 #define APP_ODRIVE_LEFT_VEL_INTEGRATOR_GAIN  (0.10f)
-#define APP_ODRIVE_RIGHT_VEL_GAIN            (0.05f)
-#define APP_ODRIVE_RIGHT_VEL_INTEGRATOR_GAIN (0.10f)
-#define APP_ODRIVE_LEFT_VEL_LIMIT_REV_S      (2.0f)
-#define APP_ODRIVE_RIGHT_VEL_LIMIT_REV_S     (2.0f)
+#define APP_ODRIVE_RIGHT_VEL_GAIN            (0.03f)
+#define APP_ODRIVE_RIGHT_VEL_INTEGRATOR_GAIN (0.05f)
+#define APP_ODRIVE_LEFT_VEL_LIMIT_REV_S      (5.0f)
+#define APP_ODRIVE_RIGHT_VEL_LIMIT_REV_S     (5.0f)
 #define APP_ODRIVE_LEFT_CURRENT_LIMIT_A      (10.0f)
-#define APP_ODRIVE_RIGHT_CURRENT_LIMIT_A     (10.0f)
+#define APP_ODRIVE_RIGHT_CURRENT_LIMIT_A     (8.0f)
+#define APP_ODRIVE_LEFT_BOOST_LIMIT_REV_S    (5.0f)
+#define APP_ODRIVE_RIGHT_BOOST_LIMIT_REV_S   (0.80f)
+#define APP_UART1_BAUDRATE                    115200U
+#define APP_UART1_TX_FIFO_SIZE                4096U
+
+#define ODRV_AXIS_ERROR_INVALID_STATE             0x00000001UL
+#define ODRV_AXIS_ERROR_DC_BUS_UNDER_VOLTAGE      0x00000002UL
+#define ODRV_AXIS_ERROR_DC_BUS_OVER_VOLTAGE       0x00000004UL
+#define ODRV_AXIS_ERROR_CURRENT_MEAS_TIMEOUT      0x00000008UL
+#define ODRV_AXIS_ERROR_BRAKE_RESISTOR_DISARMED   0x00000010UL
+#define ODRV_AXIS_ERROR_MOTOR_DISARMED            0x00000020UL
+#define ODRV_AXIS_ERROR_MOTOR_FAILED              0x00000040UL
+#define ODRV_AXIS_ERROR_SENSORLESS_FAILED         0x00000080UL
+#define ODRV_AXIS_ERROR_ENCODER_FAILED            0x00000100UL
+#define ODRV_AXIS_ERROR_CONTROLLER_FAILED         0x00000200UL
+#define ODRV_AXIS_ERROR_WATCHDOG_EXPIRED          0x00000800UL
+#define ODRV_AXIS_ERROR_ESTOP_REQUESTED           0x00004000UL
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -70,6 +90,8 @@ DMA_HandleTypeDef hdma_spi3_tx;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim11;
 
+UART_HandleTypeDef huart1;
+
 /* USER CODE BEGIN PV */
 ICM20948_t imu;
 ICM20948_PhysSample_t s;
@@ -78,12 +100,45 @@ static uint8_t g_odrive_closed_loop_requested = 0u;
 static uint8_t g_odrive_idle_requested = 0u;
 static uint32_t g_last_axis_state_cmd_ms = 0u;
 static uint8_t g_last_control_enabled = 0u;
+static uint8_t g_drive_start_arming = 0u;
+static uint32_t g_drive_start_arm_ms = 0u;
+static uint8_t g_odrive_enable_reinit_active = 0u;
+static uint8_t g_odrive_enable_reinit_phase = 0u;
+static uint32_t g_odrive_enable_reinit_last_ms = 0u;
 
 static volatile uint8_t g_drive_step_pending = 0u;
 
 static can_mcp2515_odrive_t g_can_odrive;
 static app_runtime_t g_app;
 static rover_drive_output_t g_rover_out;
+
+typedef struct
+{
+    uint8_t latched;
+    uint8_t detail_req_sent;
+    uint8_t source_node;
+    uint8_t reserved0;
+    uint32_t fault_ms;
+    uint32_t left_axis_error_first;
+    uint32_t right_axis_error_first;
+    uint32_t left_active_errors_first;
+    uint32_t right_active_errors_first;
+    uint32_t left_disarm_reason_first;
+    uint32_t right_disarm_reason_first;
+} app_odrive_fault_latch_t;
+
+static app_odrive_fault_latch_t g_odrive_fault;
+
+static app_serial_t g_uart1_serial;
+static uint8_t g_uart1_rx_byte;
+static uint8_t g_uart1_tx_byte;
+static uint8_t g_uart1_tx_fifo[APP_UART1_TX_FIFO_SIZE];
+static volatile uint16_t g_uart1_tx_wr;
+static volatile uint16_t g_uart1_tx_rd;
+static volatile uint8_t g_uart1_tx_busy;
+static volatile uint32_t g_uart1_rx_overflow_count;
+static volatile uint32_t g_uart1_tx_overflow_count;
+static volatile uint32_t g_uart1_rx_error_count;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -94,14 +149,29 @@ static void MX_SPI1_Init(void);
 static void MX_SPI3_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM11_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void RoverLedStep(void);
 static void DebugTelemetryStep(void);
 static void RoverDriveStep(void);
 static void AppOdriveRequestIdle(uint32_t now_ms);
 static void AppOdriveRequestClosedLoop(uint32_t now_ms);
+static void AppRoverEmergencyStop(uint32_t now_ms);
+static void AppRoverSafetyTimeoutStop(uint32_t now_ms);
 static void AppOdriveApplyVelocityRuntimeConfig(void);
+static void AppOdriveClearCachedErrors(void);
+static void AppOdriveFaultLatchReset(void);
+static void AppOdriveFaultLatchUpdate(uint32_t now_ms, uint8_t request_detail);
+static const char *AppOdriveAxisErrorShortName(uint32_t axis_error);
+static float AppOdriveClampAbs(float value, float limit_abs);
+static void AppOdriveBeginEnableReinit(uint32_t now_ms);
+static uint8_t AppOdriveStepEnableReinit(uint32_t now_ms);
 static void app_debug_printf(const char *fmt, ...);
+static void AppUart1ConsoleInit(void);
+static void AppUart1StartRxIt(void);
+static void AppUart1TxKick(void);
+static app_serial_status_t AppUart1WriteBytes(const uint8_t *data, uint16_t len);
+app_serial_status_t app_serial_output_bytes(const uint8_t *data, uint16_t len);
 static uint8_t app_are_axes_ready(void);
 static uint8_t app_has_odrive_errors(void);
 static app_serial_status_t app_serial_custom_cmd_cb(app_serial_t *serial, void *ctx, const char *line, uint8_t *handled);
@@ -109,8 +179,115 @@ static app_serial_status_t app_serial_custom_cmd_cb(app_serial_t *serial, void *
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define MAIN_MODULE_VERSION                 "M10"
+#define MAIN_MODULE_VERSION                 "M18"
 #define PROJECT_ROVER_DEBUG_REVISION        MAIN_MODULE_VERSION "-" ROVER_DRIVE_MODULE_VERSION "-" HARDWAREINIT_MODULE_VERSION "-" APP_SERIAL_MODULE_VERSION "-O0.2-I1.1.0"
+
+
+static void AppUart1TxKick(void)
+{
+    if (g_uart1_tx_busy != 0u)
+    {
+        return;
+    }
+
+    if (g_uart1_tx_rd == g_uart1_tx_wr)
+    {
+        return;
+    }
+
+    g_uart1_tx_byte = g_uart1_tx_fifo[g_uart1_tx_rd];
+    g_uart1_tx_rd = (uint16_t)((g_uart1_tx_rd + 1u) % APP_UART1_TX_FIFO_SIZE);
+    g_uart1_tx_busy = 1u;
+
+    if (HAL_UART_Transmit_IT(&huart1, &g_uart1_tx_byte, 1u) != HAL_OK)
+    {
+        g_uart1_tx_busy = 0u;
+        g_uart1_tx_overflow_count++;
+    }
+}
+
+static app_serial_status_t AppUart1WriteBytes(const uint8_t *data, uint16_t len)
+{
+    uint16_t i;
+    uint16_t next_wr;
+
+    if ((data == NULL) || (len == 0u))
+    {
+        return APP_SERIAL_STATUS_BAD_ARG;
+    }
+
+    __disable_irq();
+    for (i = 0u; i < len; i++)
+    {
+        next_wr = (uint16_t)((g_uart1_tx_wr + 1u) % APP_UART1_TX_FIFO_SIZE);
+        if (next_wr == g_uart1_tx_rd)
+        {
+            g_uart1_tx_overflow_count++;
+            __enable_irq();
+            AppUart1TxKick();
+            return APP_SERIAL_STATUS_FULL;
+        }
+        g_uart1_tx_fifo[g_uart1_tx_wr] = data[i];
+        g_uart1_tx_wr = next_wr;
+    }
+    __enable_irq();
+
+    AppUart1TxKick();
+    return APP_SERIAL_STATUS_OK;
+}
+
+app_serial_status_t app_serial_output_bytes(const uint8_t *data, uint16_t len)
+{
+    uint8_t cdc_status;
+    app_serial_status_t uart_status;
+
+    if ((data == NULL) || (len == 0u))
+    {
+        return APP_SERIAL_STATUS_BAD_ARG;
+    }
+
+    cdc_status = CDC_Transmit_FS((uint8_t *)data, len);
+    uart_status = AppUart1WriteBytes(data, len);
+
+    if ((cdc_status == USBD_OK) || (uart_status == APP_SERIAL_STATUS_OK))
+    {
+        return APP_SERIAL_STATUS_OK;
+    }
+
+    if ((cdc_status == USBD_BUSY) || (uart_status == APP_SERIAL_STATUS_FULL))
+    {
+        return APP_SERIAL_STATUS_BUSY;
+    }
+
+    return APP_SERIAL_STATUS_ERROR;
+}
+
+static void AppUart1StartRxIt(void)
+{
+    if (HAL_UART_Receive_IT(&huart1, &g_uart1_rx_byte, 1u) != HAL_OK)
+    {
+        g_uart1_rx_error_count++;
+    }
+}
+
+static void AppUart1ConsoleInit(void)
+{
+    if (app_serial_init(&g_uart1_serial) != APP_SERIAL_STATUS_OK)
+    {
+        Error_Handler();
+    }
+
+    g_uart1_serial.get_param = hardwareinit_serial_get_param;
+    g_uart1_serial.set_param = hardwareinit_serial_set_param;
+    g_uart1_serial.get_enable = hardwareinit_serial_get_enable;
+    g_uart1_serial.set_enable = hardwareinit_serial_set_enable;
+    g_uart1_serial.user_ctx = &g_app;
+    g_uart1_serial.custom_cmd = app_serial_custom_cmd_cb;
+    g_uart1_serial.custom_ctx = &g_app;
+
+    app_serial_cdc_set_target(&g_app.serial);
+    AppUart1StartRxIt();
+}
 
 void IMUService(void)
 {
@@ -140,7 +317,7 @@ void IMUService(void)
 
 static void app_debug_printf(const char *fmt, ...)
 {
-    char buf[384];
+    char buf[768];
     va_list args;
     int n;
 
@@ -158,7 +335,7 @@ static void app_debug_printf(const char *fmt, ...)
         n = (int)sizeof(buf) - 1;
     }
 
-    (void)CDC_Transmit_FS((uint8_t *)buf, (uint16_t)n);
+    (void)app_serial_output_bytes((const uint8_t *)buf, (uint16_t)n);
 }
 
 static uint8_t app_are_axes_ready(void)
@@ -192,6 +369,159 @@ static uint8_t app_has_odrive_errors(void)
         return 1u;
     }
     return 0u;
+}
+
+static float AppOdriveClampAbs(float value, float limit_abs)
+{
+    if (limit_abs <= 0.0f)
+    {
+        return 0.0f;
+    }
+    if (value > limit_abs)
+    {
+        return limit_abs;
+    }
+    if (value < -limit_abs)
+    {
+        return -limit_abs;
+    }
+    return value;
+}
+
+static const char *AppOdriveAxisErrorShortName(uint32_t axis_error)
+{
+    if (axis_error == 0U)
+    {
+        return "OK";
+    }
+    if ((axis_error & ODRV_AXIS_ERROR_DC_BUS_UNDER_VOLTAGE) != 0U)
+    {
+        return "DC_UV";
+    }
+    if ((axis_error & ODRV_AXIS_ERROR_DC_BUS_OVER_VOLTAGE) != 0U)
+    {
+        return "DC_OV";
+    }
+    if ((axis_error & ODRV_AXIS_ERROR_ENCODER_FAILED) != 0U)
+    {
+        return "ENC";
+    }
+    if ((axis_error & ODRV_AXIS_ERROR_MOTOR_FAILED) != 0U)
+    {
+        return "MOTOR";
+    }
+    if ((axis_error & ODRV_AXIS_ERROR_CONTROLLER_FAILED) != 0U)
+    {
+        return "CTRL";
+    }
+    if ((axis_error & ODRV_AXIS_ERROR_CURRENT_MEAS_TIMEOUT) != 0U)
+    {
+        return "CUR_TO";
+    }
+    if ((axis_error & ODRV_AXIS_ERROR_WATCHDOG_EXPIRED) != 0U)
+    {
+        return "WATCH";
+    }
+    if ((axis_error & ODRV_AXIS_ERROR_INVALID_STATE) != 0U)
+    {
+        return "STATE";
+    }
+    if ((axis_error & ODRV_AXIS_ERROR_ESTOP_REQUESTED) != 0U)
+    {
+        return "ESTOP";
+    }
+    return "AXIS";
+}
+
+static void AppOdriveFaultLatchReset(void)
+{
+    memset(&g_odrive_fault, 0, sizeof(g_odrive_fault));
+}
+
+static void AppOdriveFaultLatchUpdate(uint32_t now_ms, uint8_t request_detail)
+{
+    uint8_t have_fault;
+
+    have_fault = 0U;
+
+    if (g_can_odrive.node1.heartbeat.axis_error != 0U)
+    {
+        have_fault = 1U;
+        if (g_odrive_fault.left_axis_error_first == 0U)
+        {
+            g_odrive_fault.left_axis_error_first = g_can_odrive.node1.heartbeat.axis_error;
+        }
+        if (g_odrive_fault.source_node == 0U)
+        {
+            g_odrive_fault.source_node = 1U;
+        }
+    }
+
+    if (g_can_odrive.node2.heartbeat.axis_error != 0U)
+    {
+        have_fault = 1U;
+        if (g_odrive_fault.right_axis_error_first == 0U)
+        {
+            g_odrive_fault.right_axis_error_first = g_can_odrive.node2.heartbeat.axis_error;
+        }
+        if (g_odrive_fault.source_node == 0U)
+        {
+            g_odrive_fault.source_node = 2U;
+        }
+    }
+
+    if ((g_can_odrive.node1.error.valid != 0U) &&
+        ((g_can_odrive.node1.error.active_errors != 0U) || (g_can_odrive.node1.error.disarm_reason != 0U)))
+    {
+        have_fault = 1U;
+        if (g_odrive_fault.left_active_errors_first == 0U)
+        {
+            g_odrive_fault.left_active_errors_first = g_can_odrive.node1.error.active_errors;
+        }
+        if (g_odrive_fault.left_disarm_reason_first == 0U)
+        {
+            g_odrive_fault.left_disarm_reason_first = g_can_odrive.node1.error.disarm_reason;
+        }
+        if (g_odrive_fault.source_node == 0U)
+        {
+            g_odrive_fault.source_node = 1U;
+        }
+    }
+
+    if ((g_can_odrive.node2.error.valid != 0U) &&
+        ((g_can_odrive.node2.error.active_errors != 0U) || (g_can_odrive.node2.error.disarm_reason != 0U)))
+    {
+        have_fault = 1U;
+        if (g_odrive_fault.right_active_errors_first == 0U)
+        {
+            g_odrive_fault.right_active_errors_first = g_can_odrive.node2.error.active_errors;
+        }
+        if (g_odrive_fault.right_disarm_reason_first == 0U)
+        {
+            g_odrive_fault.right_disarm_reason_first = g_can_odrive.node2.error.disarm_reason;
+        }
+        if (g_odrive_fault.source_node == 0U)
+        {
+            g_odrive_fault.source_node = 2U;
+        }
+    }
+
+    if (have_fault == 0U)
+    {
+        return;
+    }
+
+    if (g_odrive_fault.latched == 0U)
+    {
+        g_odrive_fault.latched = 1U;
+        g_odrive_fault.fault_ms = now_ms;
+    }
+
+    if ((request_detail != 0U) && (g_odrive_fault.detail_req_sent == 0U))
+    {
+        (void)odrive_pair_request_raw_rtr(&g_can_odrive, CAN_MCP2515_ODRIVE_CMD_GET_ERROR);
+        g_odrive_fault.detail_req_sent = 1U;
+    }
 }
 
 static void RoverLedStep(void)
@@ -237,7 +567,8 @@ static void DebugTelemetryStep(void)
     app_debug_printf(
         "DBG[%s] t=%lu en=%u mode=%s ready=%u err=%u tout=%u "
         "fwd=%ld turn=%ld Bv=%ld Bt=%lu Ba=%u Ltar=%ld Rtar=%ld Lout=%ld Rout=%ld "
-        "Lvel=%ld Rvel=%ld Lstate=%u Rstate=%u Lerr=%lu Rerr=%lu "
+        "Lcmd=%ld Rcmd=%ld Q=%u Utx=%lu Urx=%lu Ue=%lu Lvel=%ld Rvel=%ld Lstate=%u Rstate=%u Lerr=%lu Rerr=%lu "
+        "Lf=%lu Rf=%lu Fs=%u Ln=%s Rn=%s LA=%lu RA=%lu LD=%lu RD=%lu "
         "gz=%ld ax=%ld ay=%ld az=%ld\r\n",
 
         PROJECT_ROVER_DEBUG_REVISION,
@@ -257,6 +588,12 @@ static void DebugTelemetryStep(void)
         (long)(g_rover_out.right_target_rev_s * 1000.0f),
         (long)(g_rover_out.left_output_rev_s * 1000.0f),
         (long)(g_rover_out.right_output_rev_s * 1000.0f),
+        (long)(g_can_odrive.node1.last_vel_cmd * 1000.0f),
+        (long)(g_can_odrive.node2.last_vel_cmd * 1000.0f),
+        (unsigned)g_can_odrive.diag.queue_count,
+        (unsigned long)g_uart1_tx_overflow_count,
+        (unsigned long)g_uart1_rx_overflow_count,
+        (unsigned long)g_uart1_rx_error_count,
 
         (long)(g_can_odrive.pair.vel1 * 1000.0f),
         (long)(g_can_odrive.pair.vel2 * 1000.0f),
@@ -264,6 +601,15 @@ static void DebugTelemetryStep(void)
         (unsigned)g_can_odrive.node2.heartbeat.axis_state,
         (unsigned long)g_can_odrive.node1.heartbeat.axis_error,
         (unsigned long)g_can_odrive.node2.heartbeat.axis_error,
+        (unsigned long)g_odrive_fault.left_axis_error_first,
+        (unsigned long)g_odrive_fault.right_axis_error_first,
+        (unsigned)g_odrive_fault.source_node,
+        AppOdriveAxisErrorShortName(g_odrive_fault.left_axis_error_first),
+        AppOdriveAxisErrorShortName(g_odrive_fault.right_axis_error_first),
+        (unsigned long)g_odrive_fault.left_active_errors_first,
+        (unsigned long)g_odrive_fault.right_active_errors_first,
+        (unsigned long)g_odrive_fault.left_disarm_reason_first,
+        (unsigned long)g_odrive_fault.right_disarm_reason_first,
 
         (long)(s.gyro_rads[2] * 1000.0f),
         (long)(s.accel_mps2[0] * 1000.0f),
@@ -304,6 +650,12 @@ void app_can_odrive_init(void)
     g_odrive_idle_requested = 0u;
     g_last_axis_state_cmd_ms = 0u;
     g_last_control_enabled = 0u;
+    g_drive_start_arming = 0u;
+    g_drive_start_arm_ms = 0u;
+    g_odrive_enable_reinit_active = 0u;
+    g_odrive_enable_reinit_phase = 0u;
+    g_odrive_enable_reinit_last_ms = 0u;
+    AppOdriveFaultLatchReset();
 }
 
 static void AppOdriveApplyVelocityRuntimeConfig(void)
@@ -325,6 +677,94 @@ static void AppOdriveApplyVelocityRuntimeConfig(void)
                                  APP_ODRIVE_RIGHT_CURRENT_LIMIT_A);
 }
 
+
+static void AppOdriveClearCachedErrors(void)
+{
+    g_can_odrive.node1.heartbeat.axis_error = 0U;
+    g_can_odrive.node2.heartbeat.axis_error = 0U;
+    g_can_odrive.node1.error.active_errors = 0U;
+    g_can_odrive.node2.error.active_errors = 0U;
+    g_can_odrive.node1.error.disarm_reason = 0U;
+    g_can_odrive.node2.error.disarm_reason = 0U;
+}
+
+static void AppOdriveBeginEnableReinit(uint32_t now_ms)
+{
+    g_odrive_enable_reinit_active = 1U;
+    g_odrive_enable_reinit_phase = 0U;
+    g_odrive_enable_reinit_last_ms = now_ms;
+    g_drive_start_arming = 0U;
+    g_drive_start_arm_ms = 0U;
+    g_odrive_closed_loop_requested = 0U;
+    g_odrive_idle_requested = 0U;
+    AppOdriveFaultLatchReset();
+    AppOdriveClearCachedErrors();
+}
+
+static uint8_t AppOdriveStepEnableReinit(uint32_t now_ms)
+{
+    if (g_odrive_enable_reinit_active == 0U)
+    {
+        return 0U;
+    }
+
+    if ((g_odrive_enable_reinit_phase != 0U) &&
+        ((uint32_t)(now_ms - g_odrive_enable_reinit_last_ms) < APP_ODRIVE_ENABLE_REINIT_STEP_MS))
+    {
+        return 1U;
+    }
+
+    if (g_odrive_enable_reinit_phase == 0U)
+    {
+        AppOdriveClearCachedErrors();
+        (void)odrive_pair_clear_errors(&g_can_odrive, 0U);
+        (void)odrive_pair_set_input_vel(&g_can_odrive, 0.0f, 0.0f, 0.0f, 0.0f);
+        (void)odrive_pair_set_axis_state(&g_can_odrive, ODRV_AXIS_STATE_IDLE, ODRV_AXIS_STATE_IDLE);
+        g_odrive_idle_requested = 1U;
+        g_odrive_closed_loop_requested = 0U;
+        g_last_axis_state_cmd_ms = now_ms;
+        g_odrive_enable_reinit_phase = 1U;
+        g_odrive_enable_reinit_last_ms = now_ms;
+        return 1U;
+    }
+
+    if (g_odrive_enable_reinit_phase == 1U)
+    {
+        AppOdriveApplyVelocityRuntimeConfig();
+        (void)odrive_pair_set_input_vel(&g_can_odrive, 0.0f, 0.0f, 0.0f, 0.0f);
+        g_odrive_enable_reinit_phase = 2U;
+        g_odrive_enable_reinit_last_ms = now_ms;
+        return 1U;
+    }
+
+    if (g_odrive_enable_reinit_phase == 2U)
+    {
+        AppOdriveClearCachedErrors();
+        (void)odrive_pair_clear_errors(&g_can_odrive, 0U);
+        (void)odrive_pair_set_input_vel(&g_can_odrive, 0.0f, 0.0f, 0.0f, 0.0f);
+        (void)odrive_pair_set_axis_state(&g_can_odrive,
+                                         ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL,
+                                         ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL);
+        g_odrive_closed_loop_requested = 1U;
+        g_odrive_idle_requested = 0U;
+        g_last_axis_state_cmd_ms = now_ms;
+        g_odrive_enable_reinit_phase = 3U;
+        g_odrive_enable_reinit_last_ms = now_ms;
+        return 1U;
+    }
+
+    if ((uint32_t)(now_ms - g_odrive_enable_reinit_last_ms) < APP_ODRIVE_ENABLE_REINIT_SETTLE_MS)
+    {
+        (void)odrive_pair_set_input_vel(&g_can_odrive, 0.0f, 0.0f, 0.0f, 0.0f);
+        return 1U;
+    }
+
+    AppOdriveClearCachedErrors();
+    g_odrive_enable_reinit_active = 0U;
+    g_odrive_enable_reinit_phase = 0U;
+    return 0U;
+}
+
 static void AppOdriveRequestIdle(uint32_t now_ms)
 {
     if ((g_odrive_idle_requested != 0u) &&
@@ -344,8 +784,7 @@ static void AppOdriveRequestIdle(uint32_t now_ms)
 
 static void AppOdriveRequestClosedLoop(uint32_t now_ms)
 {
-    if ((g_odrive_closed_loop_requested != 0u) &&
-        ((uint32_t)(now_ms - g_last_axis_state_cmd_ms) < APP_ODRIVE_STATE_CMD_PERIOD_MS))
+    if (g_odrive_closed_loop_requested != 0u)
     {
         return;
     }
@@ -358,6 +797,51 @@ static void AppOdriveRequestClosedLoop(uint32_t now_ms)
     g_odrive_closed_loop_requested = 1u;
     g_odrive_idle_requested = 0u;
     g_last_axis_state_cmd_ms = now_ms;
+}
+
+static void AppRoverEmergencyStop(uint32_t now_ms)
+{
+    AppOdriveFaultLatchUpdate(now_ms, 1U);
+
+    g_app.control_enabled = 0u;
+    g_last_control_enabled = 0u;
+    g_odrive_enable_reinit_active = 0u;
+    g_odrive_enable_reinit_phase = 0u;
+    g_drive_start_arming = 0u;
+    g_drive_start_arm_ms = 0u;
+
+    rover_drive_stop(&g_app.command, now_ms);
+    rover_drive_reset_outputs(&g_app.drive, now_ms);
+    memset(&g_rover_out, 0, sizeof(g_rover_out));
+    g_rover_out.valid = 1u;
+    g_rover_out.enabled = 0u;
+    g_rover_out.mode = ROVER_DRIVE_MODE_FAULT;
+
+    g_odrive_idle_requested = 0u;
+    g_odrive_closed_loop_requested = 0u;
+    (void)odrive_pair_set_input_vel(&g_can_odrive, 0.0f, 0.0f, 0.0f, 0.0f);
+    AppOdriveRequestIdle(now_ms);
+}
+
+static void AppRoverSafetyTimeoutStop(uint32_t now_ms)
+{
+    g_odrive_enable_reinit_active = 0u;
+    g_odrive_enable_reinit_phase = 0u;
+    g_drive_start_arming = 0u;
+    g_drive_start_arm_ms = 0u;
+
+    rover_drive_stop(&g_app.command, now_ms);
+    rover_drive_reset_outputs(&g_app.drive, now_ms);
+    memset(&g_rover_out, 0, sizeof(g_rover_out));
+    g_rover_out.valid = 1u;
+    g_rover_out.enabled = 1u;
+    g_rover_out.timeout = 1u;
+    g_rover_out.mode = ROVER_DRIVE_MODE_READY;
+
+    g_odrive_idle_requested = 0u;
+    g_odrive_closed_loop_requested = 0u;
+    (void)odrive_pair_set_input_vel(&g_can_odrive, 0.0f, 0.0f, 0.0f, 0.0f);
+    AppOdriveRequestIdle(now_ms);
 }
 
 void odrive_full_init(void)
@@ -402,28 +886,94 @@ static void RoverDriveStep(void)
 
     now_ms = HAL_GetTick();
     fault = app_has_odrive_errors();
+    if (fault != 0U)
+    {
+        AppOdriveFaultLatchUpdate(now_ms, 1U);
+    }
 
     if ((g_app.control_enabled != 0u) && (g_last_control_enabled == 0u))
     {
         rover_drive_stop(&g_app.command, now_ms);
         rover_drive_reset_outputs(&g_app.drive, now_ms);
         memset(&g_rover_out, 0, sizeof(g_rover_out));
-        AppOdriveRequestIdle(now_ms);
+        g_rover_out.valid = 1u;
+        g_rover_out.enabled = 1u;
+        g_rover_out.mode = ROVER_DRIVE_MODE_READY;
+        AppOdriveBeginEnableReinit(now_ms);
     }
     g_last_control_enabled = g_app.control_enabled;
 
     if (g_app.control_enabled == 0u)
     {
+        g_odrive_enable_reinit_active = 0u;
+        g_odrive_enable_reinit_phase = 0u;
+        g_drive_start_arming = 0u;
+        g_drive_start_arm_ms = 0u;
         (void)rover_drive_step(&g_app.drive, 0u, 0u, &g_app.command, now_ms, &g_rover_out);
         AppOdriveRequestIdle(now_ms);
         return;
     }
 
+    if (g_odrive_enable_reinit_active != 0u)
+    {
+        (void)rover_drive_step(&g_app.drive, 1u, 0u, &g_app.command, now_ms, &g_rover_out);
+        g_rover_out.mode = ROVER_DRIVE_MODE_READY;
+        g_rover_out.timeout = 0u;
+        if (AppOdriveStepEnableReinit(now_ms) != 0u)
+        {
+            return;
+        }
+        fault = app_has_odrive_errors();
+        if (fault != 0U)
+        {
+            AppOdriveFaultLatchUpdate(now_ms, 1U);
+        }
+    }
+
     if (fault != 0u)
     {
-        (void)rover_drive_step(&g_app.drive, 0u, 1u, &g_app.command, now_ms, &g_rover_out);
+        AppRoverEmergencyStop(now_ms);
+        return;
+    }
+
+    cmd_active = 0u;
+    if ((g_app.command.forward_cmd > APP_ROVER_DRIVE_CMD_ACTIVE_EPS) ||
+        (g_app.command.forward_cmd < -APP_ROVER_DRIVE_CMD_ACTIVE_EPS) ||
+        (g_app.command.turn_cmd > APP_ROVER_DRIVE_CMD_ACTIVE_EPS) ||
+        (g_app.command.turn_cmd < -APP_ROVER_DRIVE_CMD_ACTIVE_EPS))
+    {
+        cmd_active = 1u;
+    }
+
+    if (cmd_active == 0u)
+    {
+        g_drive_start_arming = 0u;
+        g_drive_start_arm_ms = 0u;
+        (void)rover_drive_step(&g_app.drive, 1u, 0u, &g_app.command, now_ms, &g_rover_out);
         AppOdriveRequestIdle(now_ms);
         return;
+    }
+
+    if (g_odrive_closed_loop_requested == 0u)
+    {
+        g_drive_start_arming = 1u;
+        g_drive_start_arm_ms = now_ms;
+    }
+
+    if (g_drive_start_arming != 0u)
+    {
+        AppOdriveRequestClosedLoop(now_ms);
+        (void)odrive_pair_set_input_vel(&g_can_odrive, 0.0f, 0.0f, 0.0f, 0.0f);
+        (void)rover_drive_step(&g_app.drive, 0u, 0u, &g_app.command, now_ms, &g_rover_out);
+
+        if ((uint32_t)(now_ms - g_drive_start_arm_ms) < APP_ODRIVE_CLOSED_LOOP_SETTLE_MS)
+        {
+            return;
+        }
+
+        g_drive_start_arming = 0u;
+        g_app.command.last_cmd_ms = now_ms;
+        rover_drive_reset_outputs(&g_app.drive, now_ms);
     }
 
     if (rover_drive_step(&g_app.drive,
@@ -439,39 +989,31 @@ static void RoverDriveStep(void)
 
     if (g_rover_out.timeout != 0u)
     {
-        AppOdriveRequestIdle(now_ms);
+        AppRoverSafetyTimeoutStop(now_ms);
         return;
     }
 
-    cmd_active = 0u;
-    if ((g_rover_out.forward_cmd > APP_ROVER_DRIVE_CMD_ACTIVE_EPS) ||
-        (g_rover_out.forward_cmd < -APP_ROVER_DRIVE_CMD_ACTIVE_EPS) ||
-        (g_rover_out.turn_cmd > APP_ROVER_DRIVE_CMD_ACTIVE_EPS) ||
-        (g_rover_out.turn_cmd < -APP_ROVER_DRIVE_CMD_ACTIVE_EPS))
+    AppOdriveRequestClosedLoop(now_ms);
+
     {
-        cmd_active = 1u;
+        float left_cmd_rev_s;
+        float right_cmd_rev_s;
+
+        left_cmd_rev_s = g_rover_out.left_output_rev_s;
+        right_cmd_rev_s = g_rover_out.right_output_rev_s;
+
+        if (g_rover_out.boost_active != 0U)
+        {
+            left_cmd_rev_s = AppOdriveClampAbs(left_cmd_rev_s, APP_ODRIVE_LEFT_BOOST_LIMIT_REV_S);
+            right_cmd_rev_s = AppOdriveClampAbs(right_cmd_rev_s, APP_ODRIVE_RIGHT_BOOST_LIMIT_REV_S);
+        }
+
+        (void)odrive_pair_set_input_vel(&g_can_odrive,
+                                        left_cmd_rev_s,
+                                        0.0f,
+                                        right_cmd_rev_s,
+                                        0.0f);
     }
-
-    if (cmd_active == 0u)
-    {
-        AppOdriveRequestIdle(now_ms);
-        return;
-    }
-
-    if (app_are_axes_ready() == 0u)
-    {
-        AppOdriveRequestClosedLoop(now_ms);
-        return;
-    }
-
-    g_odrive_closed_loop_requested = 1u;
-    g_odrive_idle_requested = 0u;
-
-    (void)odrive_pair_set_input_vel(&g_can_odrive,
-                                    g_rover_out.left_output_rev_s,
-                                    0.0f,
-                                    g_rover_out.right_output_rev_s,
-                                    0.0f);
 }
 
 
@@ -528,16 +1070,46 @@ static app_serial_status_t app_serial_custom_cmd_cb(app_serial_t *serial, void *
     if (strcmp(line, "get odrive") == 0)
     {
         *handled = 1u;
+        AppOdriveFaultLatchUpdate(HAL_GetTick(), 1U);
         return app_serial_printf(serial,
-                                 "RSP odrive ready=%u err=%u Lstate=%u Rstate=%u Lerr=%lu Rerr=%lu Lvel=%.4f Rvel=%.4f\r\n",
+                                 "RSP odrive ready=%u err=%u Q=%u Lstate=%u Rstate=%u Lerr=%lu Rerr=%lu Lf=%lu Rf=%lu Fs=%u Ln=%s Rn=%s LA=%lu RA=%lu LD=%lu RD=%lu Lcmd=%.4f Rcmd=%.4f Lvel=%.4f Rvel=%.4f\r\n",
                                  (unsigned)app_are_axes_ready(),
                                  (unsigned)app_has_odrive_errors(),
+                                 (unsigned)g_can_odrive.diag.queue_count,
                                  (unsigned)g_can_odrive.node1.heartbeat.axis_state,
                                  (unsigned)g_can_odrive.node2.heartbeat.axis_state,
                                  (unsigned long)g_can_odrive.node1.heartbeat.axis_error,
                                  (unsigned long)g_can_odrive.node2.heartbeat.axis_error,
+                                 (unsigned long)g_odrive_fault.left_axis_error_first,
+                                 (unsigned long)g_odrive_fault.right_axis_error_first,
+                                 (unsigned)g_odrive_fault.source_node,
+                                 AppOdriveAxisErrorShortName(g_odrive_fault.left_axis_error_first),
+                                 AppOdriveAxisErrorShortName(g_odrive_fault.right_axis_error_first),
+                                 (unsigned long)g_odrive_fault.left_active_errors_first,
+                                 (unsigned long)g_odrive_fault.right_active_errors_first,
+                                 (unsigned long)g_odrive_fault.left_disarm_reason_first,
+                                 (unsigned long)g_odrive_fault.right_disarm_reason_first,
+                                 g_can_odrive.node1.last_vel_cmd,
+                                 g_can_odrive.node2.last_vel_cmd,
                                  g_can_odrive.pair.vel1,
                                  g_can_odrive.pair.vel2);
+    }
+
+
+    if (strcmp(line, "get uart") == 0)
+    {
+        *handled = 1u;
+        return app_serial_printf(serial,
+                                 "RSP uart1 baud=%lu tx_ovf=%lu rx_ovf=%lu rx_err=%lu tx_busy=%u rx_wr=%u rx_rd=%u tx_wr=%u tx_rd=%u\r\n",
+                                 (unsigned long)APP_UART1_BAUDRATE,
+                                 (unsigned long)g_uart1_tx_overflow_count,
+                                 (unsigned long)g_uart1_rx_overflow_count,
+                                 (unsigned long)g_uart1_rx_error_count,
+                                 (unsigned)g_uart1_tx_busy,
+                                 (unsigned)g_uart1_serial.rx_wr,
+                                 (unsigned)g_uart1_serial.rx_rd,
+                                 (unsigned)g_uart1_tx_wr,
+                                 (unsigned)g_uart1_tx_rd);
     }
 
     if (strcmp(line, "get imu") == 0)
@@ -592,6 +1164,7 @@ int main(void)
   MX_TIM2_Init();
   MX_USB_DEVICE_Init();
   MX_TIM11_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
   if (hardwareinit_runtime_init(&g_app) != HARDWAREINIT_STATUS_OK)
@@ -605,6 +1178,8 @@ int main(void)
 
   g_app.serial.custom_cmd = app_serial_custom_cmd_cb;
   g_app.serial.custom_ctx = &g_app;
+
+  AppUart1ConsoleInit();
 
   rover_drive_stop(&g_app.command, HAL_GetTick());
   rover_drive_reset_outputs(&g_app.drive, HAL_GetTick());
@@ -625,6 +1200,7 @@ int main(void)
 
         RoverLedStep();
         (void)app_serial_process(&g_app.serial);
+        (void)app_serial_process(&g_uart1_serial);
         DebugTelemetryStep();
 
         if (g_drive_step_pending != 0u)
@@ -837,6 +1413,28 @@ static void MX_TIM11_Init(void)
 
 }
 
+
+static void MX_USART1_UART_Init(void)
+{
+  __HAL_RCC_USART1_CLK_ENABLE();
+
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = APP_UART1_BAUDRATE;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
+}
+
 /**
   * Enable DMA controller clock
   */
@@ -903,6 +1501,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  GPIO_InitStruct.Pin = GPIO_PIN_9|GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /*Configure GPIO pin : ICM_CS_Pin */
   GPIO_InitStruct.Pin = ICM_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -958,6 +1563,39 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
     can_mcp2515_odrive_spi_error_callback(&g_can_odrive, hspi);
+}
+
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        if (app_serial_rx_bytes(&g_uart1_serial, &g_uart1_rx_byte, 1u) != APP_SERIAL_STATUS_OK)
+        {
+            g_uart1_rx_overflow_count++;
+        }
+        AppUart1StartRxIt();
+    }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        g_uart1_tx_busy = 0u;
+        AppUart1TxKick();
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        g_uart1_rx_error_count++;
+        g_uart1_tx_busy = 0u;
+        AppUart1StartRxIt();
+        AppUart1TxKick();
+    }
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)

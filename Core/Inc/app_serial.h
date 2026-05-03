@@ -5,15 +5,15 @@
 extern "C" {
 #endif
 
-#define APP_SERIAL_MODULE_VERSION        "S06"
+#define APP_SERIAL_MODULE_VERSION        "S07"
 
 #include "main.h"
 #include <stdint.h>
 #include <stdarg.h>
 
-// Версия: S06 03.05.26
+// Версия: S07 03.05.26
 // Назначение:
-// USB CDC ASCII интерфейс для rover controller.
+// USB CDC + UART ASCII интерфейс для rover controller.
 // Поддерживает параметры rover_drive и пользовательские команды drive/stop/get imu/get odrive.
 // Оставлены только параметры rover controller.
 //
@@ -62,7 +62,7 @@ typedef app_serial_status_t (*app_serial_custom_cmd_fn)(app_serial_t *serial, vo
 
 #define APP_SERIAL_RX_FIFO_SIZE          256u
 #define APP_SERIAL_LINE_SIZE             128u
-#define APP_SERIAL_TX_LINE_SIZE          192u
+#define APP_SERIAL_TX_LINE_SIZE          320u
 #define APP_SERIAL_TOKEN_NAME_SIZE       48u
 
 typedef struct app_serial_s
@@ -95,6 +95,7 @@ app_serial_status_t app_serial_init(app_serial_t *serial);
 app_serial_status_t app_serial_rx_bytes(app_serial_t *serial, const uint8_t *data, uint32_t len);
 app_serial_status_t app_serial_process(app_serial_t *serial);
 app_serial_status_t app_serial_printf(app_serial_t *serial, const char *fmt, ...);
+app_serial_status_t app_serial_output_bytes(const uint8_t *data, uint16_t len);
 void app_serial_cdc_set_target(app_serial_t *serial);
 void app_serial_cdc_rx_callback(uint8_t *buf, uint32_t len);
 

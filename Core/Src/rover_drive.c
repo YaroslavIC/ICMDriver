@@ -199,14 +199,14 @@ rover_drive_status_t rover_drive_step(rover_drive_t *drv,
 
     timeout = 0u;
     drv->out.saturated = 0u;
+    forward = rover_clampf(cmd->forward_cmd, -ROVER_DRIVE_CMD_LIMIT, ROVER_DRIVE_CMD_LIMIT);
+    turn = rover_clampf(cmd->turn_cmd, -ROVER_DRIVE_CMD_LIMIT, ROVER_DRIVE_CMD_LIMIT);
     if ((drv->params.cmd_timeout_ms > 0.0f) &&
+        ((rover_absf(forward) > 0.0001f) || (rover_absf(turn) > 0.0001f)) &&
         ((uint32_t)(now_ms - cmd->last_cmd_ms) > (uint32_t)drv->params.cmd_timeout_ms))
     {
         timeout = 1u;
     }
-
-    forward = rover_clampf(cmd->forward_cmd, -ROVER_DRIVE_CMD_LIMIT, ROVER_DRIVE_CMD_LIMIT);
-    turn = rover_clampf(cmd->turn_cmd, -ROVER_DRIVE_CMD_LIMIT, ROVER_DRIVE_CMD_LIMIT);
     boost_vel = rover_clampf(cmd->boost_vel_rev_s, 0.0f, ROVER_DRIVE_MAX_BOOST_VEL_REV_S);
     boost_ms = rover_clampf(cmd->boost_ms, 0.0f, ROVER_DRIVE_MAX_BOOST_MS);
     boost_active = 0u;
@@ -242,11 +242,6 @@ rover_drive_status_t rover_drive_step(rover_drive_t *drv,
         left_target *= rover_drive_sanitize_dir(drv->params.left_dir);
         right_target *= rover_drive_sanitize_dir(drv->params.right_dir);
 
-        if ((boost_vel > drv->params.max_vel_rev_s) && (drv->params.max_vel_rev_s > 0.0f))
-        {
-            boost_vel = drv->params.max_vel_rev_s;
-        }
-
         if ((boost_vel > 0.0f) && (boost_ms > 0.0f) &&
             ((uint32_t)(now_ms - cmd->last_cmd_ms) <= (uint32_t)boost_ms) &&
             ((rover_absf(left_target) > 0.0001f) || (rover_absf(right_target) > 0.0001f)))
@@ -265,8 +260,21 @@ rover_drive_status_t rover_drive_step(rover_drive_t *drv,
 
     drv->out.left_target_rev_s = left_target;
     drv->out.right_target_rev_s = right_target;
-    drv->out.left_output_rev_s = rover_drive_apply_ramp(drv->out.left_output_rev_s, left_target, max_delta);
-    drv->out.right_output_rev_s = rover_drive_apply_ramp(drv->out.right_output_rev_s, right_target, max_delta);
+    if ((enabled == 0u) || (fault != 0u) || (timeout != 0u))
+    {
+        drv->out.left_output_rev_s = 0.0f;
+        drv->out.right_output_rev_s = 0.0f;
+    }
+    else if (boost_active != 0u)
+    {
+        drv->out.left_output_rev_s = left_target;
+        drv->out.right_output_rev_s = right_target;
+    }
+    else
+    {
+        drv->out.left_output_rev_s = rover_drive_apply_ramp(drv->out.left_output_rev_s, left_target, max_delta);
+        drv->out.right_output_rev_s = rover_drive_apply_ramp(drv->out.right_output_rev_s, right_target, max_delta);
+    }
     drv->out.forward_cmd = forward;
     drv->out.turn_cmd = turn;
     drv->out.boost_vel_rev_s = boost_vel;
@@ -280,7 +288,7 @@ rover_drive_status_t rover_drive_step(rover_drive_t *drv,
     {
         drv->out.mode = ROVER_DRIVE_MODE_FAULT;
     }
-    else if (enabled == 0u)
+    else if ((enabled == 0u) || (timeout != 0u))
     {
         drv->out.mode = ROVER_DRIVE_MODE_IDLE;
     }
