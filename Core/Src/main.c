@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Rover controller main program body
   ******************************************************************************
   * @attention
   *
@@ -24,17 +24,13 @@
 /* USER CODE BEGIN Includes */
 #include "icm20948_driver.h"
 #include "can_mcp2515_odrive.h"
-#include "ekf_driver.h"
+#include "rover_drive.h"
+#include "hardwareinit.h"
+#include "app_serial.h"
+#include "usbd_cdc_if.h"
 #include <string.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
-#include "usbd_cdc_if.h"
-#include "app_serial.h"
-#include "flash_cfg_store.h"
-#include "balance.h"
-#include "hardwareinit.h"
-#include "balance_calibration.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,13 +41,22 @@
 /* USER CODE BEGIN PD */
 #define ODRV_AXIS_STATE_IDLE                  1U
 #define ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL   8U
-#define ODRV_CONTROL_MODE_TORQUE_CONTROL      1U
+#define ODRV_CONTROL_MODE_VELOCITY_CONTROL    2U
 #define ODRV_INPUT_MODE_PASSTHROUGH           1U
+#define APP_ODRIVE_STATE_CMD_PERIOD_MS        250U
+#define APP_ROVER_DRIVE_CMD_ACTIVE_EPS       (0.001f)
+#define APP_ODRIVE_LEFT_VEL_GAIN             (0.05f)
+#define APP_ODRIVE_LEFT_VEL_INTEGRATOR_GAIN  (0.10f)
+#define APP_ODRIVE_RIGHT_VEL_GAIN            (0.05f)
+#define APP_ODRIVE_RIGHT_VEL_INTEGRATOR_GAIN (0.10f)
+#define APP_ODRIVE_LEFT_VEL_LIMIT_REV_S      (2.0f)
+#define APP_ODRIVE_RIGHT_VEL_LIMIT_REV_S     (2.0f)
+#define APP_ODRIVE_LEFT_CURRENT_LIMIT_A      (10.0f)
+#define APP_ODRIVE_RIGHT_CURRENT_LIMIT_A     (10.0f)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -68,22 +73,17 @@ TIM_HandleTypeDef htim11;
 /* USER CODE BEGIN PV */
 ICM20948_t imu;
 ICM20948_PhysSample_t s;
-ekf_driver_t g_ekf;
-ekf_state_snapshot_t snap;
 
-static uint32_t g_started = 0U;
-static uint32_t g_last_diag_ms = 0U;
-static uint32_t g_last_cmd_ms  = 0U;
-static uint32_t g_test_start_ms = 0U;
-static uint32_t g_last_cal_encoder_req_ms = 0U;
+static uint8_t g_odrive_closed_loop_requested = 0u;
+static uint8_t g_odrive_idle_requested = 0u;
+static uint32_t g_last_axis_state_cmd_ms = 0u;
+static uint8_t g_last_control_enabled = 0u;
 
-static volatile uint8_t g_ctrl_step_pending = 0u;
-static volatile uint64_t g_ctrl_step_ts_us = 0ull;
+static volatile uint8_t g_drive_step_pending = 0u;
 
 static can_mcp2515_odrive_t g_can_odrive;
 static app_runtime_t g_app;
-static balance_output_t g_balance_out;
-static balance_calibration_t g_balance_cal;
+static rover_drive_output_t g_rover_out;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -95,25 +95,22 @@ static void MX_SPI3_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM11_Init(void);
 /* USER CODE BEGIN PFP */
-static void VerticalLedStep(const ekf_state_snapshot_t *state);
+static void RoverLedStep(void);
 static void DebugTelemetryStep(void);
-static void ControlTorqueStep(void);
-static void app_log_line_cb(void *ctx, const char *line);
-static float app_get_left_vel_cb(void *ctx);
-static float app_get_right_vel_cb(void *ctx);
-static balance_calibration_status_t app_set_pair_torque_cb(void *ctx, float u_left, float u_right);
-static uint8_t app_are_axes_ready_cb(void *ctx);
-static uint8_t app_has_errors_cb(void *ctx);
-static uint8_t app_is_control_enabled_cb(void *ctx);
-static balance_calibration_status_t app_set_control_enabled_cb(void *ctx, uint8_t value);
-static balance_calibration_status_t app_save_calibration_cb(void *ctx, const balance_calibration_persist_t *persist);
+static void RoverDriveStep(void);
+static void AppOdriveRequestIdle(uint32_t now_ms);
+static void AppOdriveRequestClosedLoop(uint32_t now_ms);
+static void AppOdriveApplyVelocityRuntimeConfig(void);
+static void app_debug_printf(const char *fmt, ...);
+static uint8_t app_are_axes_ready(void);
+static uint8_t app_has_odrive_errors(void);
 static app_serial_status_t app_serial_custom_cmd_cb(app_serial_t *serial, void *ctx, const char *line, uint8_t *handled);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define MAIN_MODULE_VERSION                 "M04"
-#define PROJECT_BALANCE_DEBUG_REVISION  MAIN_MODULE_VERSION "-" BALANCE_MODULE_VERSION "-" HARDWAREINIT_MODULE_VERSION "-" APP_SERIAL_MODULE_VERSION "-" EKF_DRIVER_MODULE_VERSION
+#define MAIN_MODULE_VERSION                 "M10"
+#define PROJECT_ROVER_DEBUG_REVISION        MAIN_MODULE_VERSION "-" ROVER_DRIVE_MODULE_VERSION "-" HARDWAREINIT_MODULE_VERSION "-" APP_SERIAL_MODULE_VERSION "-O0.2-I1.1.0"
 
 void IMUService(void)
 {
@@ -143,7 +140,7 @@ void IMUService(void)
 
 static void app_debug_printf(const char *fmt, ...)
 {
-    char buf[320];
+    char buf[384];
     va_list args;
     int n;
 
@@ -164,68 +161,24 @@ static void app_debug_printf(const char *fmt, ...)
     (void)CDC_Transmit_FS((uint8_t *)buf, (uint16_t)n);
 }
 
-static void app_log_line_cb(void *ctx, const char *line)
+static uint8_t app_are_axes_ready(void)
 {
-    (void)ctx;
-    if (line == NULL)
-    {
-        return;
-    }
-    app_debug_printf("%s\r\n", line);
-}
-
-static float app_get_left_vel_cb(void *ctx)
-{
-    (void)ctx;
-
-    if (snap.valid != 0u)
-    {
-        return snap.wheel_vel_left_raw;
-    }
-
-    return g_can_odrive.pair.vel1;
-}
-
-static float app_get_right_vel_cb(void *ctx)
-{
-    (void)ctx;
-
-    if (snap.valid != 0u)
-    {
-        return snap.wheel_vel_right_raw;
-    }
-
-    return g_can_odrive.pair.vel2;
-}
-
-static balance_calibration_status_t app_set_pair_torque_cb(void *ctx, float u_left, float u_right)
-{
-    (void)ctx;
-    if (odrive_pair_set_input_torque(&g_can_odrive, u_left, u_right) != CAN_MCP2515_ODRIVE_STATUS_OK)
-    {
-        return BALANCE_CALIBRATION_STATUS_ERROR;
-    }
-    return BALANCE_CALIBRATION_STATUS_OK;
-}
-
-static uint8_t app_are_axes_ready_cb(void *ctx)
-{
-    (void)ctx;
     if ((g_can_odrive.node1.heartbeat.valid == 0u) || (g_can_odrive.node2.heartbeat.valid == 0u))
     {
         return 0u;
     }
+
     if ((g_can_odrive.node1.heartbeat.axis_state != ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL) ||
         (g_can_odrive.node2.heartbeat.axis_state != ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL))
     {
         return 0u;
     }
+
     return 1u;
 }
 
-static uint8_t app_has_errors_cb(void *ctx)
+static uint8_t app_has_odrive_errors(void)
 {
-    (void)ctx;
     if ((g_can_odrive.node1.heartbeat.axis_error != 0u) || (g_can_odrive.node2.heartbeat.axis_error != 0u))
     {
         return 1u;
@@ -241,123 +194,15 @@ static uint8_t app_has_errors_cb(void *ctx)
     return 0u;
 }
 
-static uint8_t app_is_control_enabled_cb(void *ctx)
+static void RoverLedStep(void)
 {
-    app_runtime_t *app;
-
-    app = (app_runtime_t *)ctx;
-    if (app == NULL)
-    {
-        return 0u;
-    }
-    return app->control_enabled;
-}
-
-static balance_calibration_status_t app_set_control_enabled_cb(void *ctx, uint8_t value)
-{
-    app_runtime_t *app;
-
-    app = (app_runtime_t *)ctx;
-    if (app == NULL)
-    {
-        return BALANCE_CALIBRATION_STATUS_BAD_ARG;
-    }
-
-    app->control_enabled = (value != 0u) ? 1u : 0u;
-    if (app->control_enabled == 0u)
-    {
-        app->command.motion_fwd_cmd = 0.0f;
-        app->command.motion_turn_cmd = 0.0f;
-        (void)balance_reset(&app->balance, snap.wheel_pos_avg, HAL_GetTick());
-    }
-
-    return BALANCE_CALIBRATION_STATUS_OK;
-}
-
-static balance_calibration_status_t app_save_calibration_cb(void *ctx, const balance_calibration_persist_t *persist)
-{
-    app_runtime_t *app;
-
-    app = (app_runtime_t *)ctx;
-    if ((app == NULL) || (persist == NULL))
-    {
-        return BALANCE_CALIBRATION_STATUS_BAD_ARG;
-    }
-
-    app->calib_data = *persist;
-    app->calib_loaded = 1u;
-    if (hardwareinit_save_to_flash(app) != HARDWAREINIT_STATUS_OK)
-    {
-        return BALANCE_CALIBRATION_STATUS_FLASH_ERROR;
-    }
-    return BALANCE_CALIBRATION_STATUS_OK;
-}
-
-static app_serial_status_t app_serial_custom_cmd_cb(app_serial_t *serial, void *ctx, const char *line, uint8_t *handled)
-{
-    app_runtime_t *app;
-
-    if ((serial == NULL) || (ctx == NULL) || (line == NULL) || (handled == NULL))
-    {
-        return APP_SERIAL_STATUS_BAD_ARG;
-    }
-
-    *handled = 0u;
-    app = (app_runtime_t *)ctx;
-
-    if (strcmp(line, "CALIB_START") == 0)
-    {
-        *handled = 1u;
-        if (balance_calibration_is_active(&g_balance_cal) != 0u)
-        {
-            return app_serial_printf(serial, "ERR calib_busy\r\n");
-        }
-        if (balance_calibration_start(&g_balance_cal, HAL_GetTick()) != BALANCE_CALIBRATION_STATUS_OK)
-        {
-            return app_serial_printf(serial, "ERR calib_start_failed\r\n");
-        }
-        return app_serial_printf(serial, "RSP calib=start\r\n");
-    }
-
-    if (strcmp(line, "CALIB_ABORT") == 0)
-    {
-        *handled = 1u;
-        balance_calibration_abort(&g_balance_cal);
-        return app_serial_printf(serial, "RSP calib=abort_req\r\n");
-    }
-
-    if (strcmp(line, "CALIB_GET") == 0)
-    {
-        *handled = 1u;
-        app_log_line_cb(app, "CALSTAT phase=GET_FLASH state=RUN");
-        balance_calibration_emit_persist(&g_balance_cal, &app->calib_data);
-        app_log_line_cb(app, "CALSTAT phase=GET_FLASH state=OK");
-        return APP_SERIAL_STATUS_OK;
-    }
-
-    return APP_SERIAL_STATUS_EMPTY;
-}
-
-static void VerticalLedStep(const ekf_state_snapshot_t *state)
-{
-    int32_t pitch_mrad;
-    int32_t rate_mrads;
-    int32_t pitch_abs;
-    int32_t rate_abs;
-
-    if ((state == NULL) || (state->valid == 0u))
+    if (app_has_odrive_errors() != 0u)
     {
         HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
         return;
     }
 
-    pitch_mrad = (int32_t)(state->pitch_rad * 1000.0f);
-    rate_mrads = (int32_t)(state->pitch_rate_rad_s * 1000.0f);
-    pitch_abs = (pitch_mrad >= 0) ? pitch_mrad : -pitch_mrad;
-    rate_abs = (rate_mrads >= 0) ? rate_mrads : -rate_mrads;
-
-    if ((pitch_abs <= (int32_t)g_app.balance.params.vertical_pitch_thresh_mrad) &&
-        (rate_abs <= (int32_t)g_app.balance.params.vertical_rate_thresh_mrads))
+    if ((g_app.control_enabled != 0u) && (app_are_axes_ready() != 0u))
     {
         HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
     }
@@ -372,57 +217,58 @@ static void DebugTelemetryStep(void)
     static uint32_t last_dbg_ms = 0u;
     uint32_t now_ms;
     uint32_t dbg_period_ms;
+    ICM20948_PhysSample_t imu_sample;
+    uint8_t imu_valid;
 
     now_ms = HAL_GetTick();
-    dbg_period_ms = (g_app.control_enabled != 0u) ? 50u : 250u;
+    dbg_period_ms = (g_app.control_enabled != 0u) ? 100u : 500u;
     if ((uint32_t)(now_ms - last_dbg_ms) < dbg_period_ms)
     {
         return;
     }
     last_dbg_ms = now_ms;
 
-    app_debug_printf(
-        "DBG[%s] t=%lu en=%u valid=%u mode=%s "
-        "pitch=%ld pitchc=%ld target=%ld trim=%ld perr=%ld rate=%ld "
-        "P=%ld D=%ld V=%ld X=%ld raw=%ld clamp=%ld sat=%u "
-        "wv=%ld wd=%ld wp=%ld wpr=%ld "
-        "u=%ld usync=%ld uturn=%ld L=%ld R=%ld "
-        "fwd=%ld turn=%ld\r\n",
+    imu_valid = (ICM20948_GetLatestPhys(&imu, &imu_sample) == ICM20948_OK) ? 1u : 0u;
+    if (imu_valid != 0u)
+    {
+        s = imu_sample;
+    }
 
-        PROJECT_BALANCE_DEBUG_REVISION,
+    app_debug_printf(
+        "DBG[%s] t=%lu en=%u mode=%s ready=%u err=%u tout=%u "
+        "fwd=%ld turn=%ld Bv=%ld Bt=%lu Ba=%u Ltar=%ld Rtar=%ld Lout=%ld Rout=%ld "
+        "Lvel=%ld Rvel=%ld Lstate=%u Rstate=%u Lerr=%lu Rerr=%lu "
+        "gz=%ld ax=%ld ay=%ld az=%ld\r\n",
+
+        PROJECT_ROVER_DEBUG_REVISION,
         (unsigned long)now_ms,
         (unsigned)g_app.control_enabled,
-        (unsigned)snap.valid,
-        balance_mode_to_string(g_balance_out.mode),
+        rover_drive_mode_to_string(g_rover_out.mode),
+        (unsigned)app_are_axes_ready(),
+        (unsigned)app_has_odrive_errors(),
+        (unsigned)g_rover_out.timeout,
 
-        (long)(snap.pitch_rad * 1000.0f),
-        (long)(g_balance_out.pitch_corr_rad * 1000.0f),
-        (long)(g_balance_out.target_pitch_rad * 1000.0f),
-        (long)(g_app.balance.state.target_trim_rad * 1000.0f),
-        (long)(g_balance_out.pitch_error_rad * 1000.0f),
-        (long)(snap.pitch_rate_rad_s * 1000.0f),
+        (long)(g_rover_out.forward_cmd * 1000.0f),
+        (long)(g_rover_out.turn_cmd * 1000.0f),
+        (long)(g_rover_out.boost_vel_rev_s * 1000.0f),
+        (unsigned long)g_rover_out.boost_ms,
+        (unsigned)g_rover_out.boost_active,
+        (long)(g_rover_out.left_target_rev_s * 1000.0f),
+        (long)(g_rover_out.right_target_rev_s * 1000.0f),
+        (long)(g_rover_out.left_output_rev_s * 1000.0f),
+        (long)(g_rover_out.right_output_rev_s * 1000.0f),
 
-        (long)(g_balance_out.p_term * 1000.0f),
-        (long)(g_balance_out.d_term * 1000.0f),
-        (long)(g_balance_out.v_term * 1000.0f),
-        (long)(g_balance_out.x_term * 1000.0f),
-        (long)(g_balance_out.u_raw * 1000.0f),
-        (long)(g_balance_out.u_base * 1000.0f),
-        (unsigned)g_balance_out.saturated,
+        (long)(g_can_odrive.pair.vel1 * 1000.0f),
+        (long)(g_can_odrive.pair.vel2 * 1000.0f),
+        (unsigned)g_can_odrive.node1.heartbeat.axis_state,
+        (unsigned)g_can_odrive.node2.heartbeat.axis_state,
+        (unsigned long)g_can_odrive.node1.heartbeat.axis_error,
+        (unsigned long)g_can_odrive.node2.heartbeat.axis_error,
 
-        (long)(snap.wheel_vel_avg * 1000.0f),
-        (long)(snap.wheel_vel_diff * 1000.0f),
-        (long)(snap.wheel_pos_avg * 1000.0f),
-        (long)(g_balance_out.wheel_pos_rel * 1000.0f),
-
-        (long)(g_balance_out.u_base * 1000.0f),
-        (long)(g_balance_out.sync_term * 1000.0f),
-        (long)(g_balance_out.turn_term * 1000.0f),
-        (long)(g_balance_out.u_left * 1000.0f),
-        (long)(g_balance_out.u_right * 1000.0f),
-
-        (long)(g_balance_out.motion_fwd_cmd * 1000.0f),
-        (long)(g_balance_out.motion_turn_cmd * 1000.0f)
+        (long)(s.gyro_rads[2] * 1000.0f),
+        (long)(s.accel_mps2[0] * 1000.0f),
+        (long)(s.accel_mps2[1] * 1000.0f),
+        (long)(s.accel_mps2[2] * 1000.0f)
     );
 }
 
@@ -437,8 +283,8 @@ void app_can_odrive_init(void)
     g_can_odrive.int_pin = GPIO_PIN_7;
     g_can_odrive.mcp2515_osc_hz = 8000000U;
     g_can_odrive.can_bitrate = 250000U;
-    g_can_odrive.node_id_1 = 1U;
-    g_can_odrive.node_id_2 = 2U;
+    g_can_odrive.node_id_1 = 2U;   // левое заднее ведущее колесо
+    g_can_odrive.node_id_2 = 1U;   // правое заднее ведущее колесо
     g_can_odrive.mode = CAN_MCP2515_ODRIVE_MODE_NORMAL;
     g_can_odrive.poll_pair_rate_hz = 250U;
     g_can_odrive.reply_timeout_us = 3000U;
@@ -454,19 +300,64 @@ void app_can_odrive_init(void)
         Error_Handler();
     }
 
-    g_started = 0U;
-    g_last_diag_ms = HAL_GetTick();
+    g_odrive_closed_loop_requested = 0u;
+    g_odrive_idle_requested = 0u;
+    g_last_axis_state_cmd_ms = 0u;
+    g_last_control_enabled = 0u;
 }
 
-void app_can_odrive_start_sequence(void)
+static void AppOdriveApplyVelocityRuntimeConfig(void)
 {
-    if (g_started != 0U)
+    (void)odrive_pair_set_controller_mode(&g_can_odrive,
+                                          ODRV_CONTROL_MODE_VELOCITY_CONTROL,
+                                          ODRV_INPUT_MODE_PASSTHROUGH,
+                                          ODRV_CONTROL_MODE_VELOCITY_CONTROL,
+                                          ODRV_INPUT_MODE_PASSTHROUGH);
+    (void)odrive_pair_set_vel_gains(&g_can_odrive,
+                                    APP_ODRIVE_LEFT_VEL_GAIN,
+                                    APP_ODRIVE_LEFT_VEL_INTEGRATOR_GAIN,
+                                    APP_ODRIVE_RIGHT_VEL_GAIN,
+                                    APP_ODRIVE_RIGHT_VEL_INTEGRATOR_GAIN);
+    (void)odrive_pair_set_limits(&g_can_odrive,
+                                 APP_ODRIVE_LEFT_VEL_LIMIT_REV_S,
+                                 APP_ODRIVE_LEFT_CURRENT_LIMIT_A,
+                                 APP_ODRIVE_RIGHT_VEL_LIMIT_REV_S,
+                                 APP_ODRIVE_RIGHT_CURRENT_LIMIT_A);
+}
+
+static void AppOdriveRequestIdle(uint32_t now_ms)
+{
+    if ((g_odrive_idle_requested != 0u) &&
+        ((uint32_t)(now_ms - g_last_axis_state_cmd_ms) < APP_ODRIVE_STATE_CMD_PERIOD_MS))
     {
         return;
     }
 
-    (void)odrive_pair_set_axis_state(&g_can_odrive, 8U, 8U);
-    g_started = 1U;
+    (void)odrive_pair_set_input_vel(&g_can_odrive, 0.0f, 0.0f, 0.0f, 0.0f);
+    (void)odrive_pair_set_axis_state(&g_can_odrive,
+                                     ODRV_AXIS_STATE_IDLE,
+                                     ODRV_AXIS_STATE_IDLE);
+    g_odrive_idle_requested = 1u;
+    g_odrive_closed_loop_requested = 0u;
+    g_last_axis_state_cmd_ms = now_ms;
+}
+
+static void AppOdriveRequestClosedLoop(uint32_t now_ms)
+{
+    if ((g_odrive_closed_loop_requested != 0u) &&
+        ((uint32_t)(now_ms - g_last_axis_state_cmd_ms) < APP_ODRIVE_STATE_CMD_PERIOD_MS))
+    {
+        return;
+    }
+
+    AppOdriveApplyVelocityRuntimeConfig();
+    (void)odrive_pair_set_input_vel(&g_can_odrive, 0.0f, 0.0f, 0.0f, 0.0f);
+    (void)odrive_pair_set_axis_state(&g_can_odrive,
+                                     ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL,
+                                     ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL);
+    g_odrive_closed_loop_requested = 1u;
+    g_odrive_idle_requested = 0u;
+    g_last_axis_state_cmd_ms = now_ms;
 }
 
 void odrive_full_init(void)
@@ -474,27 +365,11 @@ void odrive_full_init(void)
     app_can_odrive_init();
     HAL_Delay(20);
 
-    app_can_odrive_start_sequence();
+    AppOdriveApplyVelocityRuntimeConfig();
     HAL_Delay(20);
 
-    (void)odrive_pair_set_controller_mode(&g_can_odrive,
-                                          ODRV_CONTROL_MODE_TORQUE_CONTROL,
-                                          ODRV_INPUT_MODE_PASSTHROUGH,
-                                          ODRV_CONTROL_MODE_TORQUE_CONTROL,
-                                          ODRV_INPUT_MODE_PASSTHROUGH);
-    HAL_Delay(20);
-
-    (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
-    HAL_Delay(20);
-
-    (void)odrive_pair_set_axis_state(&g_can_odrive,
-                                     ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL,
-                                     ODRV_AXIS_STATE_CLOSED_LOOP_CONTROL);
+    AppOdriveRequestIdle(HAL_GetTick());
     HAL_Delay(50);
-
-    g_last_diag_ms  = HAL_GetTick();
-    g_last_cmd_ms   = HAL_GetTick();
-    g_test_start_ms = HAL_GetTick();
 }
 
 void imu_init(void)
@@ -516,190 +391,170 @@ void imu_init(void)
     }
 
     (void)ICM20948_CalGyro(&imu);
+    (void)ICM20948_GetLatestPhys(&imu, &s);
 }
 
-void EKF_init(void)
+static void RoverDriveStep(void)
 {
-    ekf_config_t cfg;
+    uint32_t now_ms;
+    uint8_t fault;
+    uint8_t cmd_active;
 
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.pitch_gyro_axis = 1u;
-    cfg.pitch_acc_forward_axis = 0u;
-    cfg.pitch_acc_up_axis = 2u;
-    cfg.pitch_gyro_sign = +1;
-    cfg.pitch_acc_forward_sign = +1;
-    cfg.pitch_acc_up_sign = +1;
-    cfg.imu_stale_timeout_us = 5000u;
-    cfg.odrv_stale_timeout_us = 12000u;
-    cfg.q_pitch = 0.5f;
-    cfg.q_gyro_bias = 0.01f;
-    cfg.q_wheel_pos = 0.1f;
-    cfg.q_wheel_vel = 3.0f;
-    cfg.q_diff_pos = 0.1f;
-    cfg.q_diff_vel = 3.0f;
-    cfg.r_pitch_acc = 0.03f;
-    cfg.r_wheel_pos = 0.001f;
-    cfg.r_wheel_vel = 0.01f;
-    cfg.r_diff_pos = 0.001f;
-    cfg.r_diff_vel = 0.01f;
-    cfg.p0_pitch = 0.3f;
-    cfg.p0_gyro_bias = 0.2f;
-    cfg.p0_wheel_pos = 1.0f;
-    cfg.p0_wheel_vel = 1.0f;
-    cfg.p0_diff_pos = 1.0f;
-    cfg.p0_diff_vel = 1.0f;
-    cfg.wheel1_sign = +1;
-    cfg.wheel2_sign = -1;
+    now_ms = HAL_GetTick();
+    fault = app_has_odrive_errors();
 
-    if (ekf_driver_init(&g_ekf, &cfg) != EKF_STATUS_OK)
+    if ((g_app.control_enabled != 0u) && (g_last_control_enabled == 0u))
     {
-        Error_Handler();
+        rover_drive_stop(&g_app.command, now_ms);
+        rover_drive_reset_outputs(&g_app.drive, now_ms);
+        memset(&g_rover_out, 0, sizeof(g_rover_out));
+        AppOdriveRequestIdle(now_ms);
     }
+    g_last_control_enabled = g_app.control_enabled;
+
+    if (g_app.control_enabled == 0u)
+    {
+        (void)rover_drive_step(&g_app.drive, 0u, 0u, &g_app.command, now_ms, &g_rover_out);
+        AppOdriveRequestIdle(now_ms);
+        return;
+    }
+
+    if (fault != 0u)
+    {
+        (void)rover_drive_step(&g_app.drive, 0u, 1u, &g_app.command, now_ms, &g_rover_out);
+        AppOdriveRequestIdle(now_ms);
+        return;
+    }
+
+    if (rover_drive_step(&g_app.drive,
+                         1u,
+                         0u,
+                         &g_app.command,
+                         now_ms,
+                         &g_rover_out) != ROVER_DRIVE_STATUS_OK)
+    {
+        AppOdriveRequestIdle(now_ms);
+        return;
+    }
+
+    if (g_rover_out.timeout != 0u)
+    {
+        AppOdriveRequestIdle(now_ms);
+        return;
+    }
+
+    cmd_active = 0u;
+    if ((g_rover_out.forward_cmd > APP_ROVER_DRIVE_CMD_ACTIVE_EPS) ||
+        (g_rover_out.forward_cmd < -APP_ROVER_DRIVE_CMD_ACTIVE_EPS) ||
+        (g_rover_out.turn_cmd > APP_ROVER_DRIVE_CMD_ACTIVE_EPS) ||
+        (g_rover_out.turn_cmd < -APP_ROVER_DRIVE_CMD_ACTIVE_EPS))
+    {
+        cmd_active = 1u;
+    }
+
+    if (cmd_active == 0u)
+    {
+        AppOdriveRequestIdle(now_ms);
+        return;
+    }
+
+    if (app_are_axes_ready() == 0u)
+    {
+        AppOdriveRequestClosedLoop(now_ms);
+        return;
+    }
+
+    g_odrive_closed_loop_requested = 1u;
+    g_odrive_idle_requested = 0u;
+
+    (void)odrive_pair_set_input_vel(&g_can_odrive,
+                                    g_rover_out.left_output_rev_s,
+                                    0.0f,
+                                    g_rover_out.right_output_rev_s,
+                                    0.0f);
 }
 
 
-static float apply_deadzone_slope_comp(float u_raw,
-                                       float deadzone_pos,
-                                       float deadzone_neg,
-                                       float slope_pos,
-                                       float slope_neg,
-                                       float ref_slope_abs,
-                                       float u_limit)
+static app_serial_status_t app_serial_custom_cmd_cb(app_serial_t *serial, void *ctx, const char *line, uint8_t *handled)
 {
-    float mag;
-    float slope_abs;
-    float deadzone;
-    float slope_scale;
+    app_runtime_t *app;
+    float forward;
+    float turn;
+    float boost_vel;
+    float boost_ms;
+    int parsed;
 
-    if ((u_limit <= 0.0f) || (u_raw == 0.0f))
+    if ((serial == NULL) || (ctx == NULL) || (line == NULL) || (handled == NULL))
     {
-        return 0.0f;
+        return APP_SERIAL_STATUS_BAD_ARG;
     }
 
-    if (u_raw > 0.0f)
-    {
-        deadzone = deadzone_pos;
-        slope_abs = fabsf(slope_pos);
-    }
-    else
-    {
-        deadzone = deadzone_neg;
-        slope_abs = fabsf(slope_neg);
-    }
+    *handled = 0u;
+    app = (app_runtime_t *)ctx;
 
-    if (slope_abs < 1.0e-6f)
+    boost_vel = ROVER_DRIVE_DEFAULT_BOOST_VEL_REV_S;
+    boost_ms = ROVER_DRIVE_DEFAULT_BOOST_MS;
+    parsed = sscanf(line, "drive %f %f %f %f", &forward, &turn, &boost_vel, &boost_ms);
+    if (parsed >= 2)
     {
-        slope_abs = ref_slope_abs;
-    }
-
-    if (ref_slope_abs < 1.0e-6f)
-    {
-        ref_slope_abs = slope_abs;
-    }
-
-    slope_scale = ref_slope_abs / slope_abs;
-    mag = fabsf(u_raw) * slope_scale;
-
-    if (mag < 1.0e-4f)
-    {
-        return 0.0f;
+        *handled = 1u;
+        if (rover_drive_set_command_boost(&app->command,
+                                          forward,
+                                          turn,
+                                          boost_vel,
+                                          boost_ms,
+                                          HAL_GetTick()) != ROVER_DRIVE_STATUS_OK)
+        {
+            return app_serial_printf(serial, "ERR usage drive <forward:-1..1> <turn:-1..1> [boost_vel_rev_s:0..5] [boost_ms:0..3000]\r\n");
+        }
+        return app_serial_printf(serial,
+                                 "RSP drive fwd=%.3f turn=%.3f boost_vel=%.3f boost_ms=%.0f\r\n",
+                                 forward,
+                                 turn,
+                                 boost_vel,
+                                 boost_ms);
     }
 
-    mag += deadzone;
-
-    if (mag > u_limit)
+    if (strcmp(line, "stop") == 0)
     {
-        mag = u_limit;
+        *handled = 1u;
+        app->control_enabled = 0u;
+        rover_drive_stop(&app->command, HAL_GetTick());
+        (void)rover_drive_step(&app->drive, 0u, 0u, &app->command, HAL_GetTick(), &g_rover_out);
+        AppOdriveRequestIdle(HAL_GetTick());
+        return app_serial_printf(serial, "RSP stop en=0\r\n");
     }
 
-    return (u_raw > 0.0f) ? mag : -mag;
-}
-
-static void apply_balance_output_compensation(balance_output_t *out,
-                                              const balance_calibration_persist_t *cal)
-{
-    float u_limit;
-    float left_ref;
-    float right_ref;
-    float ref_slope_abs;
-
-    if ((out == NULL) || (cal == NULL))
+    if (strcmp(line, "get odrive") == 0)
     {
-        return;
+        *handled = 1u;
+        return app_serial_printf(serial,
+                                 "RSP odrive ready=%u err=%u Lstate=%u Rstate=%u Lerr=%lu Rerr=%lu Lvel=%.4f Rvel=%.4f\r\n",
+                                 (unsigned)app_are_axes_ready(),
+                                 (unsigned)app_has_odrive_errors(),
+                                 (unsigned)g_can_odrive.node1.heartbeat.axis_state,
+                                 (unsigned)g_can_odrive.node2.heartbeat.axis_state,
+                                 (unsigned long)g_can_odrive.node1.heartbeat.axis_error,
+                                 (unsigned long)g_can_odrive.node2.heartbeat.axis_error,
+                                 g_can_odrive.pair.vel1,
+                                 g_can_odrive.pair.vel2);
     }
 
-    if ((cal->flags & BALANCE_CALIBRATION_FLAG_VALID) == 0u)
+    if (strcmp(line, "get imu") == 0)
     {
-        return;
+        *handled = 1u;
+        (void)ICM20948_GetLatestPhys(&imu, &s);
+        return app_serial_printf(serial,
+                                 "RSP imu ax=%ld ay=%ld az=%ld gx=%ld gy=%ld gz=%ld\r\n",
+                                 (long)(s.accel_mps2[0] * 1000.0f),
+                                 (long)(s.accel_mps2[1] * 1000.0f),
+                                 (long)(s.accel_mps2[2] * 1000.0f),
+                                 (long)(s.gyro_rads[0] * 1000.0f),
+                                 (long)(s.gyro_rads[1] * 1000.0f),
+                                 (long)(s.gyro_rads[2] * 1000.0f));
     }
 
-    if (out->mode == BALANCE_MODE_CATCH)
-    {
-        return;
-    }
-
-    if (out->mode != BALANCE_MODE_BALANCE)
-    {
-        return;
-    }
-
-    u_limit = g_app.balance.params.control_u_limit;
-
-    left_ref = 0.5f * (fabsf(cal->l_slope_pos) + fabsf(cal->l_slope_neg));
-    right_ref = 0.5f * (fabsf(cal->r_slope_pos) + fabsf(cal->r_slope_neg));
-    ref_slope_abs = 0.5f * (left_ref + right_ref);
-
-    out->u_left = apply_deadzone_slope_comp(out->u_left,
-                                            cal->l_deadzone_pos,
-                                            cal->l_deadzone_neg,
-                                            cal->l_slope_pos,
-                                            cal->l_slope_neg,
-                                            ref_slope_abs,
-                                            u_limit);
-
-    out->u_right = apply_deadzone_slope_comp(out->u_right,
-                                             cal->r_deadzone_pos,
-                                             cal->r_deadzone_neg,
-                                             cal->r_slope_pos,
-                                             cal->r_slope_neg,
-                                             ref_slope_abs,
-                                             u_limit);
-}
-
-static void ControlTorqueStep(void)
-{
-    balance_input_t in;
-
-    memset(&in, 0, sizeof(in));
-    in.pitch_rad = snap.pitch_rad;
-    in.pitch_rate_rad_s = snap.pitch_rate_rad_s;
-    in.wheel_vel_avg = snap.wheel_vel_avg;
-    in.wheel_pos_avg = snap.wheel_pos_avg;
-    in.wheel_vel_diff = snap.wheel_vel_diff;
-    in.valid = snap.valid;
-    in.control_enabled = g_app.control_enabled;
-    in.now_ms = HAL_GetTick();
-
-    if (balance_calibration_is_active(&g_balance_cal) != 0u)
-    {
-        return;
-    }
-
-    if (balance_step(&g_app.balance, &in, &g_app.command, &g_balance_out) != BALANCE_STATUS_OK)
-    {
-        (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
-        return;
-    }
-
-    if ((g_balance_out.mode == BALANCE_MODE_IDLE) || (g_balance_out.valid == 0u))
-    {
-        (void)odrive_pair_set_input_torque(&g_can_odrive, 0.0f, 0.0f);
-        return;
-    }
-
-    apply_balance_output_compensation(&g_balance_out, &g_app.calib_data);
-
-    (void)odrive_pair_set_input_torque(&g_can_odrive, g_balance_out.u_left, g_balance_out.u_right);
+    return APP_SERIAL_STATUS_EMPTY;
 }
 /* USER CODE END 0 */
 
@@ -744,32 +599,19 @@ int main(void)
     Error_Handler();
   }
 
-  (void)balance_reset(&g_app.balance, 0.0f, HAL_GetTick());
-
   imu_init();
 
   odrive_full_init();
 
-  EKF_init();
-
   g_app.serial.custom_cmd = app_serial_custom_cmd_cb;
   g_app.serial.custom_ctx = &g_app;
 
-  balance_calibration_init(&g_balance_cal, NULL);
-  g_balance_cal.io.user_ctx = &g_app;
-  g_balance_cal.io.get_left_vel = app_get_left_vel_cb;
-  g_balance_cal.io.get_right_vel = app_get_right_vel_cb;
-  g_balance_cal.io.set_torque = app_set_pair_torque_cb;
-  g_balance_cal.io.are_axes_ready = app_are_axes_ready_cb;
-  g_balance_cal.io.has_errors = app_has_errors_cb;
-  g_balance_cal.io.is_control_enabled = app_is_control_enabled_cb;
-  g_balance_cal.io.set_control_enabled = app_set_control_enabled_cb;
-  g_balance_cal.io.log_line = app_log_line_cb;
-  g_balance_cal.io.save_persist = app_save_calibration_cb;
-  balance_calibration_set_persist(&g_balance_cal, &g_app.calib_data);
+  rover_drive_stop(&g_app.command, HAL_GetTick());
+  rover_drive_reset_outputs(&g_app.drive, HAL_GetTick());
+  memset(&g_rover_out, 0, sizeof(g_rover_out));
 
   HAL_TIM_Base_Start_IT(&htim11);
-  (void)app_serial_printf(&g_app.serial, "RSP ready\r\n");
+  (void)app_serial_printf(&g_app.serial, "RSP ready rover=%s\r\n", PROJECT_ROVER_DEBUG_REVISION);
 
   /* USER CODE END 2 */
 
@@ -777,48 +619,23 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	    ICM20948_Service(&imu);
+        IMUService();
 
-	    can_mcp2515_odrive_process(&g_can_odrive);
+        can_mcp2515_odrive_process(&g_can_odrive);
 
-	    if (balance_calibration_is_active(&g_balance_cal) != 0u)
-	    {
-	        uint32_t now_ms = HAL_GetTick();
-	        if ((uint32_t)(now_ms - g_last_cal_encoder_req_ms) >= 20u)
-	        {
-	            can_mcp2515_odrive_status_t enc_st = odrive_pair_request_encoder_estimates(&g_can_odrive);
-	            if ((enc_st == CAN_MCP2515_ODRIVE_STATUS_OK) || (enc_st == CAN_MCP2515_ODRIVE_STATUS_BUSY))
-	            {
-	                g_last_cal_encoder_req_ms = now_ms;
-	            }
-	        }
-	    }
+        RoverLedStep();
+        (void)app_serial_process(&g_app.serial);
+        DebugTelemetryStep();
 
-	    ekf_driver_update_inputs_from_drivers(&g_ekf, &imu, &g_can_odrive);
-	    ekf_driver_process_pending(&g_ekf);
-	    ekf_driver_get_state_snapshot(&g_ekf, &snap);
-	    VerticalLedStep(&snap);
-	    app_serial_process(&g_app.serial);
-
-	    balance_calibration_process(&g_balance_cal, HAL_GetTick());
-
-
-	    DebugTelemetryStep();
-
-	    if (g_ctrl_step_pending != 0u)
-	    {
-	        g_ctrl_step_pending = 0u;
-	        ControlTorqueStep();
-	    }
-
-
-
+        if (g_drive_step_pending != 0u)
+        {
+            g_drive_step_pending = 0u;
+            RoverDriveStep();
+        }
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
-
   }
   /* USER CODE END 3 */
 }
@@ -1119,21 +936,17 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
-
-
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == GPIO_PIN_7)
   {
-	  can_mcp2515_odrive_exti_callback(&g_can_odrive, GPIO_Pin);
-
+      can_mcp2515_odrive_exti_callback(&g_can_odrive, GPIO_Pin);
   }
 
   if (GPIO_Pin == GPIO_PIN_3)
-    {
+  {
       ICM20948_IrqHandler(&imu, GPIO_Pin);
-    }
+  }
 }
 
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
@@ -1146,26 +959,20 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
     can_mcp2515_odrive_spi_error_callback(&g_can_odrive, hspi);
 }
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-	static uint8_t ctrl_div = 0u;
-	uint64_t t_us;
 
-	if (htim->Instance == TIM11)
-	{
-		t_us = icm_micros64(&imu);
-
-		(void)ekf_driver_request_step_isr(&g_ekf, t_us);
-
-		ctrl_div++;
-		if (ctrl_div >= 5u)
-		{
-			ctrl_div = 0u;
-			g_ctrl_step_pending = 1u;
-			g_ctrl_step_ts_us = t_us;
-		}
-	}
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    static uint8_t drive_div = 0u;
+    if (htim->Instance == TIM11)
+    {
+        drive_div++;
+        if (drive_div >= 5u)
+        {
+            drive_div = 0u;
+            g_drive_step_pending = 1u;
+        }
+    }
 }
-
 /* USER CODE END 4 */
 
 /**

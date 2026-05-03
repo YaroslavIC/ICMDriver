@@ -65,8 +65,8 @@
 //     }
 // }
 
-#define CAN_MCP2515_ODRIVE_DRIVER_VERSION_STR "0.1"
-#define CAN_MCP2515_ODRIVE_DRIVER_BUILD_STR   "09.03.26 00:00:00"
+#define CAN_MCP2515_ODRIVE_DRIVER_VERSION_STR "0.2"
+#define CAN_MCP2515_ODRIVE_DRIVER_BUILD_STR   "03.05.26 09:20:00"
 
 #define CAN_MCP2515_ODRIVE_QUEUE_CAPACITY 8U
 #define CAN_MCP2515_ODRIVE_SPI_BUF_SIZE   32U
@@ -126,6 +126,7 @@ typedef enum
     CAN_MCP2515_ODRIVE_OP_PAIR_SET_INPUT_VEL,
     CAN_MCP2515_ODRIVE_OP_PAIR_SET_INPUT_TORQUE,
     CAN_MCP2515_ODRIVE_OP_PAIR_SET_LIMITS,
+    CAN_MCP2515_ODRIVE_OP_PAIR_SET_VEL_GAINS,
     CAN_MCP2515_ODRIVE_OP_PAIR_CLEAR_ERRORS,
     CAN_MCP2515_ODRIVE_OP_PAIR_ESTOP,
     CAN_MCP2515_ODRIVE_OP_PAIR_REQ_ENCODER,
@@ -391,6 +392,7 @@ can_mcp2515_odrive_status_t odrive_pair_set_input_pos(can_mcp2515_odrive_t *dev,
 can_mcp2515_odrive_status_t odrive_pair_set_input_vel(can_mcp2515_odrive_t *dev, float vel1_rev_s, float torque_ff1_nm, float vel2_rev_s, float torque_ff2_nm);
 can_mcp2515_odrive_status_t odrive_pair_set_input_torque(can_mcp2515_odrive_t *dev, float torque1_nm, float torque2_nm);
 can_mcp2515_odrive_status_t odrive_pair_set_limits(can_mcp2515_odrive_t *dev, float vel_limit1_rev_s, float current_limit1_a, float vel_limit2_rev_s, float current_limit2_a);
+can_mcp2515_odrive_status_t odrive_pair_set_vel_gains(can_mcp2515_odrive_t *dev, float vel_gain1, float vel_integrator_gain1, float vel_gain2, float vel_integrator_gain2);
 can_mcp2515_odrive_status_t odrive_pair_clear_errors(can_mcp2515_odrive_t *dev, uint8_t identify);
 can_mcp2515_odrive_status_t odrive_pair_estop(can_mcp2515_odrive_t *dev);
 can_mcp2515_odrive_status_t odrive_pair_request_encoder_estimates(can_mcp2515_odrive_t *dev);

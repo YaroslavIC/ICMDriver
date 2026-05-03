@@ -680,6 +680,12 @@ static void can_mcp2515_odrive_prepare_node_payload(can_mcp2515_odrive_t *dev, u
             can_mcp2515_odrive_f32_to_le(dev->current_op.f32_b[node_index], &payload[4]);
             break;
 
+        case CAN_MCP2515_ODRIVE_OP_PAIR_SET_VEL_GAINS:
+            *dlc = 8U;
+            can_mcp2515_odrive_f32_to_le(dev->current_op.f32_a[node_index], &payload[0]);
+            can_mcp2515_odrive_f32_to_le(dev->current_op.f32_b[node_index], &payload[4]);
+            break;
+
         case CAN_MCP2515_ODRIVE_OP_PAIR_CLEAR_ERRORS:
             *dlc = 1U;
             payload[0] = dev->current_op.identify;
@@ -1461,6 +1467,19 @@ can_mcp2515_odrive_status_t odrive_pair_set_limits(can_mcp2515_odrive_t *dev, fl
     op.f32_b[0] = current_limit1_a;
     op.f32_a[1] = vel_limit2_rev_s;
     op.f32_b[1] = current_limit2_a;
+    return can_mcp2515_odrive_enqueue_simple(dev, &op);
+}
+
+can_mcp2515_odrive_status_t odrive_pair_set_vel_gains(can_mcp2515_odrive_t *dev, float vel_gain1, float vel_integrator_gain1, float vel_gain2, float vel_integrator_gain2)
+{
+    can_mcp2515_odrive_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.type = CAN_MCP2515_ODRIVE_OP_PAIR_SET_VEL_GAINS;
+    op.cmd_id = CAN_MCP2515_ODRIVE_CMD_SET_VEL_GAINS;
+    op.f32_a[0] = vel_gain1;
+    op.f32_b[0] = vel_integrator_gain1;
+    op.f32_a[1] = vel_gain2;
+    op.f32_b[1] = vel_integrator_gain2;
     return can_mcp2515_odrive_enqueue_simple(dev, &op);
 }
 

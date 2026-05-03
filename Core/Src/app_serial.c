@@ -10,39 +10,14 @@ static const char *app_serial_param_name(app_serial_param_id_t id)
 {
     static const char * const names[APP_SERIAL_PARAM_COUNT] =
     {
-        "control_u_limit",
-        "control_k_pitch",
-        "control_k_pitch_rate",
-        "control_k_wheel_vel",
-        "control_k_wheel_pos",
-        "control_k_sync",
-        "control_u_sync_limit",
-        "vertical_pitch_thresh_mrad",
-        "vertical_rate_thresh_mrads",
-        "imu_pitch_zero_offset_rad",
-        "balance_target_pitch_rad",
-        "target_trim_limit_rad",
-        "target_trim_rate_rad_s",
-        "target_trim_err_gate_rad",
-        "target_trim_rate_gate_rads",
-        "target_trim_u_gate",
-        "catch2bal_pitch_th_rad",
-        "catch2bal_rate_th_rads",
-        "bal2catch_pitch_th_rad",
-        "catch_hold_ms",
-        "catch_u_limit",
-        "catch_k_pitch",
-        "catch_k_pitch_rate",
-        "catch_k_wheel_vel",
-        "catch_k_wheel_pos",
-        "catch_drive_u",
-        "fall_pitch_pos_th_rad",
-        "fall_pitch_neg_th_rad",
-        "motion_pitch_bias_per_cmd_rad",
-        "motion_cmd_rate_per_s",
-        "motion_turn_u_limit",
-        "motion_fwd_cmd",
-        "motion_turn_cmd"
+        "max_vel_rev_s",
+        "max_turn_rev_s",
+        "accel_rev_s2",
+        "left_dir",
+        "right_dir",
+        "cmd_timeout_ms",
+        "forward_cmd",
+        "turn_cmd"
     };
 
     if ((uint32_t)id >= (uint32_t)APP_SERIAL_PARAM_COUNT)
@@ -74,6 +49,22 @@ static app_serial_status_t app_serial_try_send(app_serial_t *serial, const char 
         return APP_SERIAL_STATUS_BUSY;
     }
     return APP_SERIAL_STATUS_ERROR;
+}
+
+static app_serial_status_t app_serial_call_custom(app_serial_t *serial, const char *line, uint8_t *handled)
+{
+    if ((serial == NULL) || (line == NULL) || (handled == NULL))
+    {
+        return APP_SERIAL_STATUS_BAD_ARG;
+    }
+
+    *handled = 0u;
+    if (serial->custom_cmd == NULL)
+    {
+        return APP_SERIAL_STATUS_EMPTY;
+    }
+
+    return serial->custom_cmd(serial, serial->custom_ctx, line, handled);
 }
 
 static app_serial_status_t app_serial_send_param(app_serial_t *serial, app_serial_param_id_t id)
@@ -163,6 +154,7 @@ static app_serial_status_t app_serial_handle_line(app_serial_t *serial)
     app_serial_param_id_t id;
     int n;
     app_serial_status_t status;
+    uint8_t handled;
 
     if (serial == NULL)
     {
@@ -177,7 +169,8 @@ static app_serial_status_t app_serial_handle_line(app_serial_t *serial)
 
     if (strcmp(cmd, "help") == 0)
     {
-        n = snprintf(serial->tx_line, sizeof(serial->tx_line), "RSP help: get all | get <name> | set <name> <value> | en <0|1> | CALIB_START | CALIB_ABORT | CALIB_GET\r\n");
+        n = snprintf(serial->tx_line, sizeof(serial->tx_line),
+                     "RSP help: get all|en|<name>|imu|odrive | set <name> <value> | en <0|1> | drive <forward> <turn> | stop\r\n");
         if ((n <= 0) || (n >= (int)sizeof(serial->tx_line)))
         {
             return APP_SERIAL_STATUS_ERROR;
@@ -190,7 +183,7 @@ static app_serial_status_t app_serial_handle_line(app_serial_t *serial)
         parsed = sscanf(serial->line_buf, "%15s %47s", cmd, name);
         if (parsed != 2)
         {
-            return app_serial_printf(serial, "ERR usage get <name>|all\r\n");
+            return app_serial_printf(serial, "ERR usage get <name>|all|imu|odrive\r\n");
         }
 
         if (strcmp(name, "all") == 0)
@@ -203,6 +196,12 @@ static app_serial_status_t app_serial_handle_line(app_serial_t *serial)
         if (strcmp(name, "en") == 0)
         {
             return app_serial_send_enable(serial);
+        }
+
+        status = app_serial_call_custom(serial, serial->line_buf, &handled);
+        if (handled != 0u)
+        {
+            return status;
         }
 
         id = app_serial_find_param(name);
@@ -252,16 +251,10 @@ static app_serial_status_t app_serial_handle_line(app_serial_t *serial)
         return app_serial_send_enable(serial);
     }
 
-    if (serial->custom_cmd != NULL)
+    status = app_serial_call_custom(serial, serial->line_buf, &handled);
+    if (handled != 0u)
     {
-        uint8_t handled;
-
-        handled = 0u;
-        status = serial->custom_cmd(serial, serial->custom_ctx, serial->line_buf, &handled);
-        if (handled != 0u)
-        {
-            return status;
-        }
+        return status;
     }
 
     return app_serial_printf(serial, "ERR unknown_cmd\r\n");

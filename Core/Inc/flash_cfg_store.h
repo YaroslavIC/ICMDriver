@@ -6,40 +6,24 @@ extern "C" {
 #endif
 
 #include "main.h"
-#include "balance.h"
-#include "balance_calibration.h"
+#include "rover_drive.h"
 #include <stdint.h>
 
-// Версия: 01.03 05.04.26 07:10:00
+// Версия: F01 03.05.26
 // Назначение:
-// Драйвер хранения коэффициентов балансировки и результатов калибровки во
-// Flash STM32F401CCU6. Модуль хранит одну структуру с заголовком, счетчиком
-// записи и CRC32.
-//
-// Пример инициализации:
-// flash_cfg_store_t cfg_store;
-// flash_cfg_data_t flash_data;
-// memset(&cfg_store, 0, sizeof(cfg_store));
-// if (flash_cfg_store_init(&cfg_store) != FLASH_CFG_STORE_STATUS_OK)
-// {
-//     Error_Handler();
-// }
-// if (flash_cfg_store_load(&cfg_store, &flash_data) == FLASH_CFG_STORE_STATUS_OK)
-// {
-//     // перенести flash_data в runtime
-// }
+// Хранение persistent параметров rover_drive во Flash STM32F401CCU6.
+// Используется новый формат rover controller.
 
 #define FLASH_CFG_STORE_BASE_ADDRESS            0x08020000u
 #define FLASH_CFG_STORE_FLASH_SECTOR            FLASH_SECTOR_5
 #define FLASH_CFG_STORE_FLASH_BANK              FLASH_BANK_1
-#define FLASH_CFG_STORE_MAGIC                   0x31474643u
-#define FLASH_CFG_STORE_FORMAT_VERSION          0x0005u
+#define FLASH_CFG_STORE_MAGIC                   0x32564643u
+#define FLASH_CFG_STORE_FORMAT_VERSION          0x0100u
 #define FLASH_CFG_STORE_MAX_WRITE_RETRY         1u
 
 typedef struct
 {
-    balance_params_t balance_params;
-    balance_calibration_persist_t calibration;
+    rover_drive_params_t rover_params;
 } flash_cfg_data_t;
 
 typedef enum

@@ -9,8 +9,7 @@ static void hardwareinit_runtime_to_flash(const app_runtime_t *app, flash_cfg_da
     }
 
     memset(data, 0, sizeof(*data));
-    data->balance_params = app->balance.params;
-    data->calibration = app->calib_data;
+    data->rover_params = app->drive.params;
 }
 
 static void hardwareinit_runtime_from_flash(app_runtime_t *app, const flash_cfg_data_t *data)
@@ -20,17 +19,18 @@ static void hardwareinit_runtime_from_flash(app_runtime_t *app, const flash_cfg_
         return;
     }
 
-    app->balance.params = data->balance_params;
-    app->calib_data = data->calibration;
-    app->calib_loaded = ((app->calib_data.flags & BALANCE_CALIBRATION_FLAG_VALID) != 0u) ? 1u : 0u;
+    if (rover_drive_validate_params(&data->rover_params) == ROVER_DRIVE_STATUS_OK)
+    {
+        app->drive.params = data->rover_params;
+    }
 }
 
 static uint8_t hardwareinit_param_is_persistent(app_serial_param_id_t id)
 {
     switch (id)
     {
-    case APP_SERIAL_PARAM_MOTION_FWD_CMD:
-    case APP_SERIAL_PARAM_MOTION_TURN_CMD:
+    case APP_SERIAL_PARAM_FORWARD_CMD:
+    case APP_SERIAL_PARAM_TURN_CMD:
         return 0u;
 
     default:
@@ -49,13 +49,12 @@ hardwareinit_status_t hardwareinit_runtime_init(app_runtime_t *app)
 
     memset(app, 0, sizeof(*app));
 
-    if (balance_init(&app->balance) != BALANCE_STATUS_OK)
+    if (rover_drive_init(&app->drive) != ROVER_DRIVE_STATUS_OK)
     {
-        return HARDWAREINIT_STATUS_BALANCE_ERROR;
+        return HARDWAREINIT_STATUS_ROVER_ERROR;
     }
 
-    app->command.motion_fwd_cmd = 0.0f;
-    app->command.motion_turn_cmd = 0.0f;
+    rover_drive_stop(&app->command, 0u);
     app->control_enabled = 0u;
 
     if (flash_cfg_store_init(&app->flash_store) != FLASH_CFG_STORE_STATUS_OK)
@@ -113,39 +112,14 @@ app_serial_status_t hardwareinit_serial_get_param(void *ctx, app_serial_param_id
 
     switch (id)
     {
-    case APP_SERIAL_PARAM_CONTROL_U_LIMIT: *value = app->balance.params.control_u_limit; break;
-    case APP_SERIAL_PARAM_CONTROL_K_PITCH: *value = app->balance.params.control_k_pitch; break;
-    case APP_SERIAL_PARAM_CONTROL_K_PITCH_RATE: *value = app->balance.params.control_k_pitch_rate; break;
-    case APP_SERIAL_PARAM_CONTROL_K_WHEEL_VEL: *value = app->balance.params.control_k_wheel_vel; break;
-    case APP_SERIAL_PARAM_CONTROL_K_WHEEL_POS: *value = app->balance.params.control_k_wheel_pos; break;
-    case APP_SERIAL_PARAM_CONTROL_K_SYNC: *value = app->balance.params.control_k_sync; break;
-    case APP_SERIAL_PARAM_CONTROL_U_SYNC_LIMIT: *value = app->balance.params.control_u_sync_limit; break;
-    case APP_SERIAL_PARAM_VERTICAL_PITCH_THRESH_MRAD: *value = app->balance.params.vertical_pitch_thresh_mrad; break;
-    case APP_SERIAL_PARAM_VERTICAL_RATE_THRESH_MRADS: *value = app->balance.params.vertical_rate_thresh_mrads; break;
-    case APP_SERIAL_PARAM_IMU_PITCH_ZERO_OFFSET_RAD: *value = app->balance.params.imu_pitch_zero_offset_rad; break;
-    case APP_SERIAL_PARAM_BALANCE_TARGET_PITCH_RAD: *value = app->balance.params.balance_target_pitch_rad; break;
-    case APP_SERIAL_PARAM_TARGET_TRIM_LIMIT_RAD: *value = app->balance.params.target_trim_limit_rad; break;
-    case APP_SERIAL_PARAM_TARGET_TRIM_RATE_RAD_S: *value = app->balance.params.target_trim_rate_rad_s; break;
-    case APP_SERIAL_PARAM_TARGET_TRIM_ERR_GATE_RAD: *value = app->balance.params.target_trim_err_gate_rad; break;
-    case APP_SERIAL_PARAM_TARGET_TRIM_RATE_GATE_RADS: *value = app->balance.params.target_trim_rate_gate_rads; break;
-    case APP_SERIAL_PARAM_TARGET_TRIM_U_GATE: *value = app->balance.params.target_trim_u_gate; break;
-    case APP_SERIAL_PARAM_CATCH2BAL_PITCH_TH_RAD: *value = app->balance.params.catch2bal_pitch_th_rad; break;
-    case APP_SERIAL_PARAM_CATCH2BAL_RATE_TH_RADS: *value = app->balance.params.catch2bal_rate_th_rads; break;
-    case APP_SERIAL_PARAM_BAL2CATCH_PITCH_TH_RAD: *value = app->balance.params.bal2catch_pitch_th_rad; break;
-    case APP_SERIAL_PARAM_CATCH_HOLD_MS: *value = app->balance.params.catch_hold_ms; break;
-    case APP_SERIAL_PARAM_CATCH_U_LIMIT: *value = app->balance.params.catch_u_limit; break;
-    case APP_SERIAL_PARAM_CATCH_K_PITCH: *value = app->balance.params.catch_k_pitch; break;
-    case APP_SERIAL_PARAM_CATCH_K_PITCH_RATE: *value = app->balance.params.catch_k_pitch_rate; break;
-    case APP_SERIAL_PARAM_CATCH_K_WHEEL_VEL: *value = app->balance.params.catch_k_wheel_vel; break;
-    case APP_SERIAL_PARAM_CATCH_K_WHEEL_POS: *value = app->balance.params.catch_k_wheel_pos; break;
-    case APP_SERIAL_PARAM_CATCH_DRIVE_U: *value = app->balance.params.catch_drive_u; break;
-    case APP_SERIAL_PARAM_FALL_PITCH_POS_TH_RAD: *value = app->balance.params.fall_pitch_pos_th_rad; break;
-    case APP_SERIAL_PARAM_FALL_PITCH_NEG_TH_RAD: *value = app->balance.params.fall_pitch_neg_th_rad; break;
-    case APP_SERIAL_PARAM_MOTION_PITCH_BIAS_PER_CMD_RAD: *value = app->balance.params.motion_pitch_bias_per_cmd_rad; break;
-    case APP_SERIAL_PARAM_MOTION_CMD_RATE_PER_S: *value = app->balance.params.motion_cmd_rate_per_s; break;
-    case APP_SERIAL_PARAM_MOTION_TURN_U_LIMIT: *value = app->balance.params.motion_turn_u_limit; break;
-    case APP_SERIAL_PARAM_MOTION_FWD_CMD: *value = app->command.motion_fwd_cmd; break;
-    case APP_SERIAL_PARAM_MOTION_TURN_CMD: *value = app->command.motion_turn_cmd; break;
+    case APP_SERIAL_PARAM_MAX_VEL_REV_S: *value = app->drive.params.max_vel_rev_s; break;
+    case APP_SERIAL_PARAM_MAX_TURN_REV_S: *value = app->drive.params.max_turn_rev_s; break;
+    case APP_SERIAL_PARAM_ACCEL_REV_S2: *value = app->drive.params.accel_rev_s2; break;
+    case APP_SERIAL_PARAM_LEFT_DIR: *value = app->drive.params.left_dir; break;
+    case APP_SERIAL_PARAM_RIGHT_DIR: *value = app->drive.params.right_dir; break;
+    case APP_SERIAL_PARAM_CMD_TIMEOUT_MS: *value = app->drive.params.cmd_timeout_ms; break;
+    case APP_SERIAL_PARAM_FORWARD_CMD: *value = app->command.forward_cmd; break;
+    case APP_SERIAL_PARAM_TURN_CMD: *value = app->command.turn_cmd; break;
     default:
         return APP_SERIAL_STATUS_BAD_PARAM;
     }
@@ -156,8 +130,8 @@ app_serial_status_t hardwareinit_serial_get_param(void *ctx, app_serial_param_id
 app_serial_status_t hardwareinit_serial_set_param(void *ctx, app_serial_param_id_t id, float value)
 {
     app_runtime_t *app;
-    balance_params_t prev_params;
-    balance_command_t prev_cmd;
+    rover_drive_params_t prev_params;
+    rover_drive_command_t prev_cmd;
 
     if (ctx == NULL)
     {
@@ -165,113 +139,69 @@ app_serial_status_t hardwareinit_serial_set_param(void *ctx, app_serial_param_id
     }
 
     app = (app_runtime_t *)ctx;
-    prev_params = app->balance.params;
+    prev_params = app->drive.params;
     prev_cmd = app->command;
 
     switch (id)
     {
-    case APP_SERIAL_PARAM_CONTROL_U_LIMIT:
+    case APP_SERIAL_PARAM_MAX_VEL_REV_S:
         if (value <= 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.control_u_limit = value;
+        app->drive.params.max_vel_rev_s = value;
         break;
-    case APP_SERIAL_PARAM_CONTROL_K_PITCH: app->balance.params.control_k_pitch = value; break;
-    case APP_SERIAL_PARAM_CONTROL_K_PITCH_RATE: app->balance.params.control_k_pitch_rate = value; break;
-    case APP_SERIAL_PARAM_CONTROL_K_WHEEL_VEL: app->balance.params.control_k_wheel_vel = value; break;
-    case APP_SERIAL_PARAM_CONTROL_K_WHEEL_POS: app->balance.params.control_k_wheel_pos = value; break;
-    case APP_SERIAL_PARAM_CONTROL_K_SYNC: app->balance.params.control_k_sync = value; break;
-    case APP_SERIAL_PARAM_CONTROL_U_SYNC_LIMIT:
+
+    case APP_SERIAL_PARAM_MAX_TURN_REV_S:
         if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.control_u_sync_limit = value;
+        app->drive.params.max_turn_rev_s = value;
         break;
-    case APP_SERIAL_PARAM_VERTICAL_PITCH_THRESH_MRAD:
+
+    case APP_SERIAL_PARAM_ACCEL_REV_S2:
         if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.vertical_pitch_thresh_mrad = value;
+        app->drive.params.accel_rev_s2 = value;
         break;
-    case APP_SERIAL_PARAM_VERTICAL_RATE_THRESH_MRADS:
+
+    case APP_SERIAL_PARAM_LEFT_DIR:
+        app->drive.params.left_dir = (value < 0.0f) ? -1.0f : 1.0f;
+        break;
+
+    case APP_SERIAL_PARAM_RIGHT_DIR:
+        app->drive.params.right_dir = (value < 0.0f) ? -1.0f : 1.0f;
+        break;
+
+    case APP_SERIAL_PARAM_CMD_TIMEOUT_MS:
         if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.vertical_rate_thresh_mrads = value;
+        app->drive.params.cmd_timeout_ms = value;
         break;
-    case APP_SERIAL_PARAM_IMU_PITCH_ZERO_OFFSET_RAD: app->balance.params.imu_pitch_zero_offset_rad = value; break;
-    case APP_SERIAL_PARAM_BALANCE_TARGET_PITCH_RAD: app->balance.params.balance_target_pitch_rad = value; break;
-    case APP_SERIAL_PARAM_TARGET_TRIM_LIMIT_RAD:
-        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.target_trim_limit_rad = value;
-        break;
-    case APP_SERIAL_PARAM_TARGET_TRIM_RATE_RAD_S:
-        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.target_trim_rate_rad_s = value;
-        break;
-    case APP_SERIAL_PARAM_TARGET_TRIM_ERR_GATE_RAD:
-        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.target_trim_err_gate_rad = value;
-        break;
-    case APP_SERIAL_PARAM_TARGET_TRIM_RATE_GATE_RADS:
-        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.target_trim_rate_gate_rads = value;
-        break;
-    case APP_SERIAL_PARAM_TARGET_TRIM_U_GATE:
-        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.target_trim_u_gate = value;
-        break;
-    case APP_SERIAL_PARAM_CATCH2BAL_PITCH_TH_RAD:
-        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.catch2bal_pitch_th_rad = value;
-        break;
-    case APP_SERIAL_PARAM_CATCH2BAL_RATE_TH_RADS:
-        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.catch2bal_rate_th_rads = value;
-        break;
-    case APP_SERIAL_PARAM_BAL2CATCH_PITCH_TH_RAD:
-        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.bal2catch_pitch_th_rad = value;
-        break;
-    case APP_SERIAL_PARAM_CATCH_HOLD_MS:
-        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.catch_hold_ms = value;
-        break;
-    case APP_SERIAL_PARAM_CATCH_U_LIMIT:
-        if (value <= 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.catch_u_limit = value;
-        break;
-    case APP_SERIAL_PARAM_CATCH_K_PITCH: app->balance.params.catch_k_pitch = value; break;
-    case APP_SERIAL_PARAM_CATCH_K_PITCH_RATE: app->balance.params.catch_k_pitch_rate = value; break;
-    case APP_SERIAL_PARAM_CATCH_K_WHEEL_VEL: app->balance.params.catch_k_wheel_vel = value; break;
-    case APP_SERIAL_PARAM_CATCH_K_WHEEL_POS: app->balance.params.catch_k_wheel_pos = value; break;
-    case APP_SERIAL_PARAM_CATCH_DRIVE_U: app->balance.params.catch_drive_u = value; break;
-    case APP_SERIAL_PARAM_FALL_PITCH_POS_TH_RAD: app->balance.params.fall_pitch_pos_th_rad = value; break;
-    case APP_SERIAL_PARAM_FALL_PITCH_NEG_TH_RAD: app->balance.params.fall_pitch_neg_th_rad = value; break;
-    case APP_SERIAL_PARAM_MOTION_PITCH_BIAS_PER_CMD_RAD: app->balance.params.motion_pitch_bias_per_cmd_rad = value; break;
-    case APP_SERIAL_PARAM_MOTION_CMD_RATE_PER_S:
-        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.motion_cmd_rate_per_s = value;
-        break;
-    case APP_SERIAL_PARAM_MOTION_TURN_U_LIMIT:
-        if (value < 0.0f) { return APP_SERIAL_STATUS_BAD_VALUE; }
-        app->balance.params.motion_turn_u_limit = value;
-        break;
-    case APP_SERIAL_PARAM_MOTION_FWD_CMD:
-        if ((value < -BALANCE_MOTION_CMD_LIMIT) || (value > BALANCE_MOTION_CMD_LIMIT))
+
+    case APP_SERIAL_PARAM_FORWARD_CMD:
+        if (rover_drive_set_command(&app->command, value, app->command.turn_cmd, HAL_GetTick()) != ROVER_DRIVE_STATUS_OK)
         {
             return APP_SERIAL_STATUS_BAD_VALUE;
         }
-        app->command.motion_fwd_cmd = value;
         break;
-    case APP_SERIAL_PARAM_MOTION_TURN_CMD:
-        if ((value < -BALANCE_MOTION_CMD_LIMIT) || (value > BALANCE_MOTION_CMD_LIMIT))
+
+    case APP_SERIAL_PARAM_TURN_CMD:
+        if (rover_drive_set_command(&app->command, app->command.forward_cmd, value, HAL_GetTick()) != ROVER_DRIVE_STATUS_OK)
         {
             return APP_SERIAL_STATUS_BAD_VALUE;
         }
-        app->command.motion_turn_cmd = value;
         break;
+
     default:
         return APP_SERIAL_STATUS_BAD_PARAM;
+    }
+
+    if (rover_drive_validate_params(&app->drive.params) != ROVER_DRIVE_STATUS_OK)
+    {
+        app->drive.params = prev_params;
+        app->command = prev_cmd;
+        return APP_SERIAL_STATUS_BAD_VALUE;
     }
 
     if (hardwareinit_param_is_persistent(id) != 0u)
     {
         if (hardwareinit_save_to_flash(app) != HARDWAREINIT_STATUS_OK)
         {
-            app->balance.params = prev_params;
+            app->drive.params = prev_params;
             app->command = prev_cmd;
             return APP_SERIAL_STATUS_ERROR;
         }
@@ -307,8 +237,8 @@ app_serial_status_t hardwareinit_serial_set_enable(void *ctx, uint8_t enabled)
     app->control_enabled = (enabled != 0u) ? 1u : 0u;
     if (app->control_enabled == 0u)
     {
-        app->command.motion_fwd_cmd = 0.0f;
-        app->command.motion_turn_cmd = 0.0f;
+        rover_drive_stop(&app->command, HAL_GetTick());
+        rover_drive_reset_outputs(&app->drive, HAL_GetTick());
     }
     return APP_SERIAL_STATUS_OK;
 }

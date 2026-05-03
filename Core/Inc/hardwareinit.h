@@ -5,38 +5,35 @@
 extern "C" {
 #endif
 
-#define HARDWAREINIT_MODULE_VERSION      "H05"
+#define HARDWAREINIT_MODULE_VERSION      "H06"
 
 #include "main.h"
-#include "balance.h"
-#include "balance_calibration.h"
+#include "rover_drive.h"
 #include "flash_cfg_store.h"
 #include "app_serial.h"
 #include <stdint.h>
 
-// Версия: 01.02 05.04.26 07:10:00
+// Версия: H06 03.05.26
 // Назначение:
-// Модуль инициализации приложения. Хранит рабочую структуру проекта,
-// заполняет параметры по умолчанию, загружает коэффициенты из Flash,
-// результаты калибровки и подключает serial callbacks.
+// Runtime-структура rover controller, параметры rover_drive, Flash load/save,
+// callbacks для USB serial.
 
 typedef enum
 {
     HARDWAREINIT_STATUS_OK = 0,
     HARDWAREINIT_STATUS_BAD_ARG,
     HARDWAREINIT_STATUS_FLASH_ERROR,
-    HARDWAREINIT_STATUS_BALANCE_ERROR,
+    HARDWAREINIT_STATUS_ROVER_ERROR,
     HARDWAREINIT_STATUS_SERIAL_ERROR
 } hardwareinit_status_t;
 
 typedef struct
 {
-    balance_controller_t balance;
-    balance_command_t command;
-    balance_calibration_persist_t calib_data;
+    rover_drive_t drive;
+    rover_drive_command_t command;
     uint8_t control_enabled;
     uint8_t flash_cfg_loaded;
-    uint8_t calib_loaded;
+    uint8_t reserved0;
     uint8_t reserved1;
     flash_cfg_store_t flash_store;
     app_serial_t serial;

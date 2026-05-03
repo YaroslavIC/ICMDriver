@@ -5,42 +5,26 @@
 extern "C" {
 #endif
 
-#define APP_SERIAL_MODULE_VERSION        "S05"
+#define APP_SERIAL_MODULE_VERSION        "S06"
 
 #include "main.h"
 #include <stdint.h>
 #include <stdarg.h>
 
-// Версия: 01.03 05.04.26 07:10:00
+// Версия: S06 03.05.26
 // Назначение:
-// Простой USB CDC интерфейс команд для настройки коэффициентов балансировки
-// и команд движения. Модуль принимает ASCII строки, разбирает команды и
-// отправляет ответы.
-//
-// Пример инициализации:
-// app_runtime_t app;
-// memset(&app, 0, sizeof(app));
-// app.serial.get_param = hardwareinit_serial_get_param;
-// app.serial.set_param = hardwareinit_serial_set_param;
-// app.serial.get_enable = hardwareinit_serial_get_enable;
-// app.serial.set_enable = hardwareinit_serial_set_enable;
-// app.serial.user_ctx = &app;
-// app_serial_init(&app.serial);
-//
-// Пример цикла main:
-// while (1)
-// {
-//     app_serial_process(&app.serial);
-// }
+// USB CDC ASCII интерфейс для rover controller.
+// Поддерживает параметры rover_drive и пользовательские команды drive/stop/get imu/get odrive.
+// Оставлены только параметры rover controller.
 //
 // Команды:
 // help
 // get all
-// get balance_target_pitch_rad
-// set control_k_wheel_pos 0.060
-// set motion_fwd_cmd 0.200
-// set motion_turn_cmd -0.150
-// en 1
+// get <name>
+// set <name> <value>
+// en 0|1
+// drive <forward> <turn>
+// stop
 
 typedef enum
 {
@@ -57,39 +41,14 @@ typedef enum
 
 typedef enum
 {
-    APP_SERIAL_PARAM_CONTROL_U_LIMIT = 0,
-    APP_SERIAL_PARAM_CONTROL_K_PITCH,
-    APP_SERIAL_PARAM_CONTROL_K_PITCH_RATE,
-    APP_SERIAL_PARAM_CONTROL_K_WHEEL_VEL,
-    APP_SERIAL_PARAM_CONTROL_K_WHEEL_POS,
-    APP_SERIAL_PARAM_CONTROL_K_SYNC,
-    APP_SERIAL_PARAM_CONTROL_U_SYNC_LIMIT,
-    APP_SERIAL_PARAM_VERTICAL_PITCH_THRESH_MRAD,
-    APP_SERIAL_PARAM_VERTICAL_RATE_THRESH_MRADS,
-    APP_SERIAL_PARAM_IMU_PITCH_ZERO_OFFSET_RAD,
-    APP_SERIAL_PARAM_BALANCE_TARGET_PITCH_RAD,
-    APP_SERIAL_PARAM_TARGET_TRIM_LIMIT_RAD,
-    APP_SERIAL_PARAM_TARGET_TRIM_RATE_RAD_S,
-    APP_SERIAL_PARAM_TARGET_TRIM_ERR_GATE_RAD,
-    APP_SERIAL_PARAM_TARGET_TRIM_RATE_GATE_RADS,
-    APP_SERIAL_PARAM_TARGET_TRIM_U_GATE,
-    APP_SERIAL_PARAM_CATCH2BAL_PITCH_TH_RAD,
-    APP_SERIAL_PARAM_CATCH2BAL_RATE_TH_RADS,
-    APP_SERIAL_PARAM_BAL2CATCH_PITCH_TH_RAD,
-    APP_SERIAL_PARAM_CATCH_HOLD_MS,
-    APP_SERIAL_PARAM_CATCH_U_LIMIT,
-    APP_SERIAL_PARAM_CATCH_K_PITCH,
-    APP_SERIAL_PARAM_CATCH_K_PITCH_RATE,
-    APP_SERIAL_PARAM_CATCH_K_WHEEL_VEL,
-    APP_SERIAL_PARAM_CATCH_K_WHEEL_POS,
-    APP_SERIAL_PARAM_CATCH_DRIVE_U,
-    APP_SERIAL_PARAM_FALL_PITCH_POS_TH_RAD,
-    APP_SERIAL_PARAM_FALL_PITCH_NEG_TH_RAD,
-    APP_SERIAL_PARAM_MOTION_PITCH_BIAS_PER_CMD_RAD,
-    APP_SERIAL_PARAM_MOTION_CMD_RATE_PER_S,
-    APP_SERIAL_PARAM_MOTION_TURN_U_LIMIT,
-    APP_SERIAL_PARAM_MOTION_FWD_CMD,
-    APP_SERIAL_PARAM_MOTION_TURN_CMD,
+    APP_SERIAL_PARAM_MAX_VEL_REV_S = 0,
+    APP_SERIAL_PARAM_MAX_TURN_REV_S,
+    APP_SERIAL_PARAM_ACCEL_REV_S2,
+    APP_SERIAL_PARAM_LEFT_DIR,
+    APP_SERIAL_PARAM_RIGHT_DIR,
+    APP_SERIAL_PARAM_CMD_TIMEOUT_MS,
+    APP_SERIAL_PARAM_FORWARD_CMD,
+    APP_SERIAL_PARAM_TURN_CMD,
     APP_SERIAL_PARAM_COUNT
 } app_serial_param_id_t;
 
@@ -103,7 +62,7 @@ typedef app_serial_status_t (*app_serial_custom_cmd_fn)(app_serial_t *serial, vo
 
 #define APP_SERIAL_RX_FIFO_SIZE          256u
 #define APP_SERIAL_LINE_SIZE             128u
-#define APP_SERIAL_TX_LINE_SIZE          160u
+#define APP_SERIAL_TX_LINE_SIZE          192u
 #define APP_SERIAL_TOKEN_NAME_SIZE       48u
 
 typedef struct app_serial_s

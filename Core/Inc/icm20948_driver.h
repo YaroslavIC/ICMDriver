@@ -110,7 +110,7 @@ extern "C" {
 // Для акселя используется 16-битный делитель: div = (div1<<8)|div2. Для 0: ~1125 Гц.
 #define ICM20948_RATE_ACCEL_SMPLRT_DIV_DEFAULT (0u)
 
-// Дефолтные диапазоны для балансирующего робота
+// Дефолтные диапазоны для rover controller
 #define ICM20948_ACCEL_FS_G_DEFAULT            (2u)     // +/-2g
 #define ICM20948_GYRO_FS_DPS_DEFAULT           (250u)   // +/-250 dps
 
